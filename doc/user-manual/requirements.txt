@@ -1,3 +1,4 @@
 Sphinx>=1.8.3
 sphinx_rtd_theme
 
+setuptools>=65.5.1 # not directly required, pinned by Snyk to avoid a vulnerability
