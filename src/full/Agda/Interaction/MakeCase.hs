@@ -6,10 +6,7 @@ module Agda.Interaction.MakeCase where
 
 import Prelude hiding ((!!), null)
 
-import Control.Monad
-
 import Data.Either
-import Data.Function (on)
 import qualified Data.List as List
 import Data.Maybe
 import Data.Monoid
@@ -122,7 +119,7 @@ parseVariables f cxt asb ii rng ss = do
   -- Step 2: Resolve each abstract name to a de Bruijn index.
 
   -- First, get context names of the clause.
-  let clauseCxtNames = map (fst . unDom) cxt
+  let clauseCxtNames = contextNames' cxt
 
   -- Valid names to split on are pattern variables of the clause,
   -- plus as-bindings that refer to a variable.
@@ -142,19 +139,21 @@ parseVariables f cxt asb ii rng ss = do
       -- has been refined to a module parameter we do allow splitting
       -- on it, since the instantiation could as well have been the
       -- other way around (see #2183).
-      (Just (Var i []), PatternBound) -> return (i, C.InScope)
+      (Just (Var i []), PatternBound _) -> return (i, C.InScope)
       -- Case 1b: the variable has been refined.
-      (Just v         , PatternBound) -> failInstantiatedVar s v
+      (Just v         , PatternBound _) -> failInstantiatedVar s v
       -- Case 1c: the variable is bound locally (e.g. a record let)
-      (Nothing        , PatternBound) -> failCaseLet s
+      (Nothing        , PatternBound _) -> failCaseLet s
       -- Case 1d: module parameter
       (Just (Var i []), LambdaBound ) -> failModuleBound s
       -- Case 1e: locally lambda-bound variable
       (_              , LambdaBound ) -> failLocal s
       -- Case 1f: let-bound variable
       (_              , LetBound    ) -> failLetBound s
-      -- Case 1g: with-bound variable (not used?)
-      (_              , WithBound   ) -> __IMPOSSIBLE__
+      -- Case 1g: with-bound variable
+      (_              , WithBound   ) -> failWithBound s
+      -- Case 1h: macro-bound variable (interactive command impossible in macro context)
+      (_              , MacroBound   ) -> __IMPOSSIBLE__
     -- Case 2: variable has no binding site, so we check if it can be
     -- made visible.
     Nothing -> case List.find (((==) `on` nameConcrete) name . fst) clauseVars of
@@ -173,24 +172,27 @@ parseVariables f cxt asb ii rng ss = do
 
   where
 
-  failNotVar s      = typeError $ GenericError $ "Not a variable: " ++ s
-  failUnbound s     = typeError $ GenericError $ "Unbound variable " ++ s
-  failAmbiguous s   = typeError $ GenericError $ "Ambiguous variable " ++ s
-  failLocal s       = typeError $ GenericError $
+  failNotVar s      = interactionError $ CaseSplitError $ P.text $ "Not a variable: " ++ s
+  failUnbound s     = interactionError $ CaseSplitError $ P.text $ "Unbound variable " ++ s
+  failAmbiguous s   = interactionError $ CaseSplitError $ P.text $ "Ambiguous variable " ++ s
+  failLocal s       = interactionError $ CaseSplitError $ P.text $
     "Cannot split on local variable " ++ s
-  failHiddenLocal s = typeError $ GenericError $
+  failHiddenLocal s = interactionError $ CaseSplitError $ P.text $
     "Cannot make hidden lambda-bound variable " ++ s ++ " visible"
-  failModuleBound s = typeError $ GenericError $
+  failModuleBound s = interactionError $ CaseSplitError $ P.text $
     "Cannot split on module parameter " ++ s
-  failHiddenModuleBound s = typeError $ GenericError $
+  failHiddenModuleBound s = interactionError $ CaseSplitError $ P.text $
     "Cannot make hidden module parameter " ++ s ++ " visible"
-  failLetBound s = typeError . GenericError $
+  failLetBound s = interactionError $ CaseSplitError $ P.text $
     "Cannot split on let-bound variable " ++ s
-  failInstantiatedVar s v = typeError . GenericDocError =<< sep
+  failWithBound s = interactionError $ CaseSplitError $ P.text $
+    "Cannot split on variable " ++ s ++
+    ", because it is an equality proof bound by a with-abstraction"
+  failInstantiatedVar s v = interactionError . CaseSplitError =<< sep
       [ text $ "Cannot split on variable " ++ s ++ ", because it is bound to"
       , prettyTCM v
       ]
-  failCaseLet s     = typeError $ GenericError $
+  failCaseLet s     = interactionError $ CaseSplitError $ P.text $
     "Cannot split on variable " ++ s ++
     ", because let-declarations may not be defined by pattern-matching"
 
@@ -230,7 +232,6 @@ recheckAbstractClause t sub acl = checkClauseLHS t sub acl $ \ lhs -> do
                   , clauseBody        = Nothing -- We don't need the body for make case
                   , clauseType        = Just (lhsBodyType lhs)
                   , clauseCatchall    = False
-                  , clauseExact       = Nothing
                   , clauseRecursive   = Nothing
                   , clauseUnreachable = Nothing
                   , clauseEllipsis    = lhsEllipsis $ A.spLhsInfo $ A.clauseLHS acl
@@ -253,7 +254,7 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
   InteractionPoint { ipMeta = mm, ipClause = ipCl} <- lookupInteractionPoint hole
   (f, clauseNo, clTy, clWithSub, absCl@A.Clause{ clauseRHS = rhs }, clClos) <- case ipCl of
     IPClause f i t sub cl clo -> return (f, i, t, sub, cl, clo)
-    IPNoClause                -> typeError $ GenericError $
+    IPNoClause                -> interactionError $ CaseSplitError $
       "Cannot split here, as we are not in a function definition"
   (casectxt, (prevClauses0, _clause, follClauses0)) <- getClauseZipperForIP f clauseNo
 
@@ -383,7 +384,7 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
 
     -- If any of the split variables is hidden by the ellipsis, we
     -- should force the expansion of the ellipsis.
-    let splitNames = map (\i -> fst $ unDom $ clauseCxt !! i) toSplit
+    let splitNames = map (\i -> ctxEntryName $ clauseCxt !! i) toSplit
     shouldExpandEllipsis <- return (not $ null toShow) `or2M` anyEllipsisVar f absCl splitNames
     let ell' | shouldExpandEllipsis = NoEllipsis
              | otherwise            = ell
@@ -433,7 +434,7 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
     return (f, casectxt, cs)
 
   where
-  failNoCop = typeError $ GenericError $
+  failNoCop = interactionError $ CaseSplitError $
     "OPTION --copatterns needed to split on result here"
 
   -- Split clause on given variables, return the resulting clauses together
@@ -461,7 +462,7 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
   checkClauseIsClean ipCl = do
     sips <- filter ipSolved . BiMap.elems <$> useTC stInteractionPoints
     when (List.any ((== ipCl) . ipClause) sips) $
-      typeError $ GenericError $ "Cannot split as clause rhs has been refined.  Please reload"
+      interactionError $ CaseSplitError $ "Cannot split as clause rhs has been refined.  Please reload"
 
 -- | Make the given pattern variables visible by marking their origin as
 --   'CaseSplit' and pattern origin as 'PatOSplit' in the 'SplitClause'.
@@ -483,7 +484,7 @@ makePatternVarsVisible is sc@SClause{ scPats = ps } =
 --   In this case, replace the rhs by @record{}@
 makeRHSEmptyRecord :: A.RHS -> A.RHS
 makeRHSEmptyRecord = \case
-  A.RHS{}            -> A.RHS{ rhsExpr = A.Rec empty empty, rhsConcrete = Nothing }
+  A.RHS{}            -> A.RHS{ rhsExpr = A.Rec (recInfoBrace noRange) empty, rhsConcrete = Nothing }
   rhs@A.RewriteRHS{} -> rhs{ A.rewriteRHS = makeRHSEmptyRecord $ A.rewriteRHS rhs }
   A.AbsurdRHS        -> __IMPOSSIBLE__
   A.WithRHS{}        -> __IMPOSSIBLE__
@@ -503,10 +504,6 @@ makeAbsurdClause f ell (SClause tel sps _ _ t) = do
       ]
     ]
   withCurrentModule (qnameModule f) $
-    -- Andreas, 2015-05-29 Issue 635
-    -- Contract implicit record patterns before printing.
-    -- c <- translateRecordPatterns $ Clause noRange tel perm ps NoBody t False
-    -- Jesper, 2015-09-19 Don't contract, since we do on-demand splitting
     inTopContext $ reify $ QNamed f $ Clause
       { clauseLHSRange  = noRange
       , clauseFullRange = noRange
@@ -515,7 +512,6 @@ makeAbsurdClause f ell (SClause tel sps _ _ t) = do
       , clauseBody      = Nothing
       , clauseType      = argFromDom <$> t
       , clauseCatchall    = False
-      , clauseExact       = Nothing
       , clauseRecursive   = Nothing
       , clauseUnreachable = Nothing
       , clauseEllipsis    = ell

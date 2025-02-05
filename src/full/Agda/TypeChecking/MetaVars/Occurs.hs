@@ -15,9 +15,8 @@
 
 module Agda.TypeChecking.MetaVars.Occurs where
 
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.Reader
+import Control.Monad.Except ( ExceptT, runExceptT, catchError, throwError )
+import Control.Monad.Reader ( ReaderT, runReaderT, ask, asks, local )
 
 import Data.Foldable (traverse_)
 import Data.Functor
@@ -25,8 +24,6 @@ import Data.Monoid
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.IntMap as IntMap
-import qualified Data.IntSet as IntSet
-import Data.IntSet (IntSet)
 
 import qualified Agda.Benchmarking as Bench
 
@@ -58,6 +55,8 @@ import Agda.Utils.Monad
 import Agda.Utils.Permutation
 import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Size
+import Agda.Utils.VarSet (VarSet)
+import qualified Agda.Utils.VarSet as VarSet
 
 import Agda.Utils.Impossible
 
@@ -139,8 +138,9 @@ tallyDef d = modifyOccursCheckDefs $ Set.delete d
 -- | Extra environment for the occurs check.  (Complements 'FreeEnv'.)
 data OccursExtra = OccursExtra
   { occUnfold  :: UnfoldStrategy
-  , occVars    :: VarMap          -- ^ The allowed variables with their variance.
-  , occMeta    :: MetaId          -- ^ The meta we want to solve.
+  , occMeta    :: MetaId          -- ^ The meta @m@ we want to solve.
+  , occVars    :: VarMap          -- ^ The allowed variables @xs@ with their variance.
+  , occRHS     :: Term            -- ^ The proposed solution @v@ for the meta (@m xs := v@).
   , occCxtSize :: Nat             -- ^ The size of the typing context upon invocation.
   }
 
@@ -197,7 +197,7 @@ definitionCheck d = do
         , "has relevance"
         , text . show $ getRelevance dmod
         ]
-      abort neverUnblock $ MetaIrrelevantSolution m $ Def d []
+      abort neverUnblock $ MetaIrrelevantSolution m $ occRHS $ feExtra cxt
     unless (er || usableQuantity dmod) $ do
       reportSDoc "tc.meta.occurs" 35 $ hsep
         [ "occursCheck: definition"
@@ -205,7 +205,7 @@ definitionCheck d = do
         , "has quantity"
         , text . show $ getQuantity dmod
         ]
-      abort neverUnblock $ MetaErasedSolution m $ Def d []
+      abort neverUnblock $ MetaErasedSolution m $ occRHS $ feExtra cxt
 
 metaCheck :: MetaId -> OccursM MetaId
 metaCheck m = do
@@ -228,6 +228,7 @@ metaCheck m = do
   -- WAS:
   -- when (m == m') $ if ctx == Top then patternViolation else
   --   abort ctx $ MetaOccursInItself m'
+  -- Andreas, 2024-09-28: removed error MetaOccursInItself from code base.
   when (m == m0) $ patternViolation' neverUnblock 50 $ "occursCheck failed: Found " ++ prettyShow m
 
   mv <- lookupLocalMeta m
@@ -386,10 +387,11 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
   n  <- getContextSize
   reportSDoc "tc.meta.occurs" 65 $ "occursCheck" <+> pretty m <+> text (show xs)
   let initEnv unf = FreeEnv
-        {  feExtra = OccursExtra
+        { feExtra = OccursExtra
           { occUnfold  = unf
-          , occVars    = xs
           , occMeta    = m
+          , occVars    = xs
+          , occRHS     = v
           , occCxtSize = n
           }
         , feFlexRig   = StronglyRigid -- ? Unguarded
@@ -397,7 +399,7 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
         , feSingleton = variableCheck xs
         }
   initOccursCheck mv
-  nicerErrorMessage $ do
+  do
     -- First try without normalising the term
     (occurs v `runReaderT` initEnv NoUnfold) `catchError` \err -> do
       -- If first run is inconclusive, try again with normalization
@@ -408,57 +410,6 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
           initOccursCheck mv
           occurs v `runReaderT` initEnv YesUnfold
         _ -> throwError err
-
-  where
-    -- Produce nicer error messages
-    nicerErrorMessage :: TCM a -> TCM a
-    nicerErrorMessage f = f `catchError` \ err -> case err of
-      TypeError _ _ cl -> case clValue cl of
-        MetaOccursInItself{} ->
-          typeError . GenericDocError =<<
-            fsep [ text "Refuse to construct infinite term by instantiating"
-                 , prettyTCM m
-                 , "to"
-                 , prettyTCM =<< instantiateFull v
-                 ]
-        MetaCannotDependOn _ i ->
-          ifM (isSortMeta m `and2M` (not <$> hasUniversePolymorphism))
-          ( typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to"
-                 , prettyTCM v
-                 , "since universe polymorphism is disabled"
-                 ]
-          ) {- else -}
-          ( typeError . GenericDocError =<<
-              fsep [ text "Cannot instantiate the metavariable"
-                   , prettyTCM m
-                   , "to solution"
-                   , prettyTCM v
-                   , "since it contains the variable"
-                   , enterClosure cl $ \_ -> prettyTCM (Var i [])
-                   , "which is not in scope of the metavariable"
-                   ]
-            )
-        MetaIrrelevantSolution _ _ ->
-          typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to solution"
-                 , prettyTCM v
-                 , "since (part of) the solution was created in an irrelevant context"
-                 ]
-        MetaErasedSolution _ _ ->
-          typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to solution"
-                 , prettyTCM v
-                 , "since (part of) the solution was created in an erased context"
-                 ]
-        _ -> throwError err
-      _ -> throwError err
 
 instance Occurs Term where
   occurs v = do
@@ -501,7 +452,7 @@ instance Occurs Term where
                   -- could potentially be salvaged by eta expansion.
                   ifM (($ i) <$> allowedVars) -- vv TODO: neverUnblock is not correct! What could trigger this eta expansion though?
                       (patternViolation' neverUnblock 70 $ "Disallowed var " ++ show i ++ " due to modality/relevance")
-                      (strongly $ abort neverUnblock $ MetaCannotDependOn m i)
+                      (strongly $ abort neverUnblock $ MetaCannotDependOn m (occRHS $ feExtra ctx) i)
                 -- is a singleton type with unique inhabitant sv
                 (Just sv) -> return $ sv `applyE` es
           Lam h f     -> do
@@ -510,7 +461,7 @@ instance Occurs Term where
           Lit l       -> return v
           Dummy{}     -> return v
           DontCare v  -> dontCare <$> do
-            onlyReduceTypes $ underRelevance Irrelevant $ occurs v
+            onlyReduceTypes $ underRelevance irrelevant $ occurs v
           Def d es    -> do
             definitionCheck d
             Def d <$> occDef d es
@@ -518,7 +469,7 @@ instance Occurs Term where
             definitionCheck (conName c)
             Con c ci <$> conArgs vs (occurs vs)  -- if strongly rigid, remain so, except with unreduced IApply arguments.
           Pi a b      -> Pi <$> occurs_ a <*> occurs b
-          Sort s      -> Sort <$> do underRelevance NonStrict $ occurs_ s
+          Sort s      -> Sort <$> do underRelevance shapeIrrelevant $ occurs_ s
           MetaV m' es -> do
             m' <- metaCheck m'
             -- The arguments of a meta are in a flexible position
@@ -717,7 +668,8 @@ instance Occurs a => Occurs (Arg a) where
 
 instance Occurs a => Occurs (Dom a) where
   occurs :: Occurs a => Dom a -> OccursM (Dom a)
-  occurs v = traverse occurs v
+  occurs (Dom info n f t x) =
+    Dom info n f t <$> underQuantity info (occurs x)
 
 ---------------------------------------------------------------------------
 -- * Pruning: getting rid of flexible occurrences.
@@ -910,12 +862,11 @@ instance (Subst a, AnyRigid a) => AnyRigid (Abs a) where
 
 instance AnyRigid a => AnyRigid (Arg a) where
   anyRigid f a =
-    case getRelevance a of
       -- Irrelevant arguments are definitionally equal to
       -- values, so the variables there are not considered
       -- "definitely rigid".
-      Irrelevant -> return False
-      _          -> anyRigid f $ unArg a
+    if isIrrelevant a then return False else
+      anyRigid f $ unArg a
 
 instance AnyRigid a => AnyRigid (Dom a) where
   anyRigid f dom = anyRigid f $ unDom dom
@@ -990,9 +941,9 @@ killedType args b = do
   let n = length args
   let iargs = zip (downFrom n) args
 
-  -- Turn list of bools into an IntSet containing the variables we want to kill
+  -- Turn list of bools into an VarSet containing the variables we want to kill
   -- (indices relative to b).
-  let tokill = IntSet.fromList [ i | (i, (_, True)) <- iargs ]
+  let tokill = VarSet.fromList [ i | (i, (_, True)) <- iargs ]
 
   -- First, check the free variables of b to see if they prevent any kills.
   (tokill, b) <- reallyNotFreeIn tokill b
@@ -1000,13 +951,13 @@ killedType args b = do
   -- Then recurse over the telescope (right-to-left), building up the final type.
   (killed, b) <- go (reverse $ map fst args) tokill b
 
-  -- Turn the IntSet of killed variables into the list of Arg Bool's to return.
-  let kills = [ Arg (getArgInfo dom) (IntSet.member i killed)
+  -- Turn the VarSet of killed variables into the list of Arg Bool's to return.
+  let kills = [ Arg (getArgInfo dom) (VarSet.member i killed)
               | (i, (dom, _)) <- iargs ]
   return (kills, b)
   where
-    down = IntSet.map pred
-    up   = IntSet.map succ
+    down = VarSet.mapMonotonic pred
+    up   = VarSet.mapMonotonic succ
 
     -- go Δ xs B
     -- Invariants:
@@ -1018,19 +969,19 @@ killedType args b = do
     --    where Δ' ⊆ Δ  (possibly reduced to remove dependencies, see #3177)
     --          ys ⊆ xs are the variables that were dropped from Δ
     --          B' = strengthen ys B
-    go :: (MonadReduce m) => [Dom (ArgName, Type)] -> IntSet -> Type -> m (IntSet, Type)
-    go [] xs b | IntSet.null xs = return (xs, b)
+    go :: (MonadReduce m) => [Dom (ArgName, Type)] -> VarSet -> Type -> m (VarSet, Type)
+    go [] xs b | VarSet.null xs = return (xs, b)
                | otherwise      = __IMPOSSIBLE__
     go (arg : args) xs b  -- go (Δ (x : A)) xs B, (x = deBruijn index 0)
-      | IntSet.member 0 xs = do
+      | VarSet.member 0 xs = do
           -- Case x ∈ xs. We know x ∉ FV(B), so we can safely drop x from the
           -- telescope. Drop x from xs (and shift indices) and recurse with
           -- `strengthen x B`.
-          let ys = down (IntSet.delete 0 xs)
+          let ys = down (VarSet.delete 0 xs)
           (ys, b) <- go args ys $ strengthen impossible b
           -- We need to return a set of killed variables relative to Δ (x : A), so
           -- shift ys and add x back in.
-          return (IntSet.insert 0 $ up ys, b)
+          return (VarSet.insert 0 $ up ys, b)
       | otherwise = do
           -- Case x ∉ xs. We either can't or don't want to get rid of x. In
           -- this case we have to check A for potential dependencies preventing
@@ -1044,23 +995,23 @@ killedType args b = do
           -- Shift back up to make it relative to Δ (x : A) again.
           return (up zs, b)
 
-reallyNotFreeIn :: (MonadReduce m) => IntSet -> Type -> m (IntSet, Type)
-reallyNotFreeIn xs a | IntSet.null xs = return (xs, a) -- Shortcut
+reallyNotFreeIn :: (MonadReduce m) => VarSet -> Type -> m (VarSet, Type)
+reallyNotFreeIn xs a | VarSet.null xs = return (xs, a) -- Shortcut
 reallyNotFreeIn xs a = do
   let fvs      = freeVars a
       anywhere = allVars fvs
-      rigid    = IntSet.unions [stronglyRigidVars fvs, unguardedVars fvs]
-      nonrigid = IntSet.difference anywhere rigid
-      hasNo    = IntSet.disjoint xs
+      rigid    = VarSet.unions [stronglyRigidVars fvs, unguardedVars fvs]
+      nonrigid = VarSet.difference anywhere rigid
+      hasNo    = VarSet.disjoint xs
   if hasNo nonrigid
     then
        -- No non-rigid occurrences. We can't do anything about the rigid
        -- occurrences so drop those and leave `a` untouched.
-       return (IntSet.difference xs rigid, a)
+       return (VarSet.difference xs rigid, a)
     else do
       -- If there are non-rigid occurrences we need to reduce a to see if
       -- we can get rid of them (#3177).
-      (fvs, a) <- forceNotFree (IntSet.difference xs rigid) a
+      (fvs, a) <- forceNotFree (VarSet.difference xs rigid) a
       let xs = IntMap.keysSet $ IntMap.filter (== NotFree) fvs
       return (xs, a)
 

@@ -27,7 +27,7 @@ import           Agda.Interaction.Highlighting.Range   ( rToR )  -- Range is amb
 import           Agda.Syntax.Abstract                ( IsProjP(..) )
 import qualified Agda.Syntax.Abstract      as A
 import           Agda.Syntax.Common        as Common
-import           Agda.Syntax.Concrete                ( FieldAssignment'(..) )
+import           Agda.Syntax.Concrete                ( FieldAssignment'(..), TacticAttribute' )
 import qualified Agda.Syntax.Concrete.Name as C
 import           Agda.Syntax.Info                    ( ModuleInfo(..) )
 import           Agda.Syntax.Literal
@@ -102,6 +102,7 @@ instance Hilite a => Hilite [a]
 instance Hilite a => Hilite (List1 a)
 instance Hilite a => Hilite (Maybe a)
 instance Hilite a => Hilite (Ranged a)
+instance Hilite a => Hilite (TacticAttribute' a)
 instance Hilite a => Hilite (WithHiding a)
 
 instance Hilite Void where
@@ -195,6 +196,11 @@ instance (Hilite a, Hilite b) => Hilite (a, b) where
 instance Hilite A.RecordDirectives where
   hilite (RecordDirectives _ _ _ c) = hilite c
 
+instance Hilite A.RecordConName where
+  hilite = \case
+    A.NamedRecCon x -> hilite x
+    A.FreshRecCon{} -> mempty
+
 instance Hilite A.Declaration where
   hilite = \case
       A.Axiom _ax _di ai _occ x e            -> hl ai <> hl x <> hl e
@@ -225,17 +231,19 @@ instance Hilite A.Declaration where
 
 instance Hilite A.Pragma where
   hilite = \case
-    A.OptionsPragma _strings     -> mempty
-    A.BuiltinPragma b x          -> singleAspect Keyword b <> hilite x
-    A.BuiltinNoDefPragma b k x   -> singleAspect Keyword b <> hiliteQName (Just $ kindOfNameToNameKind k) x
-    A.CompilePragma b x _foreign -> singleAspect Keyword b <> hilite x
-    A.RewritePragma r xs         -> singleAspect Keyword r <> hilite xs
-    A.StaticPragma x             -> hilite x
-    A.EtaPragma x                -> hilite x
-    A.InjectivePragma x          -> hilite x
-    A.NotProjectionLikePragma x  -> hilite x
-    A.InlinePragma _inline x     -> hilite x
-    A.DisplayPragma x ps e       -> hilite x <> hilite ps <> hilite e
+    A.OptionsPragma _strings        -> mempty
+    A.BuiltinPragma b x             -> singleAspect Keyword b <> hilite x
+    A.BuiltinNoDefPragma b k x      -> singleAspect Keyword b <> hiliteQName (Just $ kindOfNameToNameKind k) x
+    A.CompilePragma b x _foreign    -> singleAspect Keyword b <> hilite x
+    A.RewritePragma r xs            -> singleAspect Keyword r <> hilite xs
+    A.StaticPragma x                -> hilite x
+    A.EtaPragma x                   -> hilite x
+    A.InjectivePragma x             -> hilite x
+    A.InjectiveForInferencePragma x -> hilite x
+    A.NotProjectionLikePragma x     -> hilite x
+    A.OverlapPragma x _             -> hilite x
+    A.InlinePragma _inline x        -> hilite x
+    A.DisplayPragma x ps e          -> hilite x <> hilite ps <> hilite e
 
 instance Hilite A.Expr where
   hilite = \case
@@ -287,7 +295,6 @@ instance (Hilite a, IsProjP a) => Hilite (A.Pattern' a) where
       A.RecP _r ps           -> hl ps
       A.EqualP _r ps         -> hl ps
       A.WithP _ p            -> hl p
-      A.AnnP _r a p          -> hl p
 
     where
     hl a = hilite a
@@ -327,6 +334,7 @@ instance (HasRange n, Hilite p, Hilite e) => Hilite (RewriteEqn' x n p e) where
   hilite = \case
     Rewrite es    -> hilite $ fmap snd es
     Invert _x pes -> hilite pes
+    LeftLet pes   -> hilite pes
 
 instance Hilite a => Hilite (A.Clause' a) where
   hilite (A.Clause lhs strippedPats rhs wh _catchall) =
@@ -352,6 +360,7 @@ instance Hilite A.ModuleApplication where
 instance Hilite A.LetBinding where
   hilite = \case
       A.LetBind    _r ai x t e     -> hl ai <> hl x <> hl t <> hl e
+      A.LetAxiom   _r ai x t       -> hl ai <> hl x <> hl t
       A.LetPatBind _r p e          -> hl p  <> hl e
       A.LetApply mi er x es _c dir -> hl mi <> hl er <> hl x <>
                                       hl es <> hl dir
@@ -374,7 +383,7 @@ instance Hilite A.LamBinding where
     A.DomainFull bind      -> hilite bind
 
 instance Hilite a => Hilite (A.Binder' a) where
-  hilite (A.Binder p x) = hilite p <> hilite x
+  hilite (A.Binder p _ x) = hilite p <> hilite x
 
 instance Hilite A.BindName where
   hilite (A.BindName x) = hiliteBound x
@@ -394,7 +403,7 @@ instance Hilite ArgInfo where
   hilite (ArgInfo _hiding modality _origin _fv _a) = hilite modality
 
 instance Hilite Modality where
-  hilite (Modality _relevance quantity _cohesion) = hilite quantity
+  hilite (Modality _relevance quantity _cohesion _polarity) = hilite quantity
 
 -- | If the 'Quantity' attribute comes with a 'Range', highlight the
 -- corresponding attribute as 'Symbol'.

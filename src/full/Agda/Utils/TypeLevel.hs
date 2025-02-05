@@ -1,9 +1,7 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE GADTs                #-}
 {-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE PolyKinds            #-}
-{-# LANGUAGE TypeOperators        #-}
 
 -- We need undecidable instances for the definition of @Foldr@,
 -- and @Domains@ and @CoDomain@ using @If@ for instance.
@@ -59,7 +57,7 @@ data ConsMap1 :: (Function k l -> Type) -> k -> Function [l] [l] -> Type
 type instance Apply (ConsMap0 f)    a = ConsMap1 f a
 type instance Apply (ConsMap1 f a) tl = Apply f a ': tl
 
-type family Constant (b :: l) (as :: [k]) :: [l] where
+type family Constant (b :: Type) (as :: [k]) :: [Type] where
   Constant b as = Map (Constant1 b) as
 
 ------------------------------------------------------------------
@@ -71,6 +69,17 @@ type family Constant (b :: l) (as :: [k]) :: [l] where
 
 type Arrows   (as :: [Type]) (r :: Type) = Foldr (->) r as
 type Products (as :: [Type])             = Foldr (,) () as
+
+data StrictPair a b = Pair a b
+type StrictProducts (as :: [Type]) = Foldr StrictPair () as
+
+strictCurry :: (StrictPair a b -> c) -> (a -> b -> c)
+strictCurry f = \ !a !b -> f (Pair a b)
+{-# INLINE strictCurry #-}
+
+strictUncurry :: (a -> b -> c) -> (StrictPair a b -> c)
+strictUncurry f = \ !(Pair a b) -> f a b
+{-# INLINE strictUncurry #-}
 
 -- | @IsBase t@ is @'True@ whenever @t@ is *not* a function space.
 
@@ -112,6 +121,21 @@ instance Currying '[] b where
 instance Currying as b => Currying (a ': as) b where
   uncurrys _ p f = uncurry $ uncurrys (Proxy :: Proxy as) p . f
   currys   _ p f = currys (Proxy :: Proxy as) p . curry f
+
+
+class StrictCurrying as b where
+  strictUncurrys :: Proxy as -> Proxy b -> Arrows as b -> StrictProducts as -> b
+  strictCurrys   :: Proxy as -> Proxy b -> (StrictProducts as -> b) -> Arrows as b
+
+instance StrictCurrying '[] b where
+  strictUncurrys _ _ f = \ () -> f; {-# INLINE strictUncurrys #-}
+  strictCurrys   _ _ f = f ();      {-# INLINE strictCurrys #-}
+
+instance StrictCurrying as b => StrictCurrying (a ': as) b where
+  strictUncurrys _ p f = strictUncurry $ strictUncurrys (Proxy :: Proxy as) p . f
+  {-# INLINE strictUncurrys #-}
+  strictCurrys   _ p f = strictCurrys (Proxy :: Proxy as) p . strictCurry f
+  {-# INLINE strictCurrys #-}
 
 ------------------------------------------------------------------
 -- DEFUNCTIONALISATION

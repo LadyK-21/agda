@@ -1,6 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 {-| The parser doesn't know about operators and parses everything as normal
@@ -14,7 +13,7 @@
 
 module Agda.Syntax.Concrete.Operators
     ( parseApplication
-    , parseModuleApplication
+    , parseArguments
     , parseLHS
     , parsePattern
     , parsePatternSyn
@@ -25,7 +24,6 @@ import Control.Monad.Except (throwError)
 
 import Data.Either (partitionEithers)
 import qualified Data.Foldable as Fold
-import Data.Function (on)
 import qualified Data.Function
 import qualified Data.List as List
 import Data.Maybe
@@ -53,7 +51,7 @@ import Agda.Utils.Function (applyWhen)
 import Agda.Utils.Either
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.List
-import Agda.Utils.List1 (List1, pattern (:|))
+import Agda.Utils.List1 (List1, pattern (:|), (<|))
 import Agda.Utils.List2 (List2, pattern List2)
 import qualified Agda.Utils.List1 as List1
 import qualified Agda.Utils.List2 as List2
@@ -307,9 +305,8 @@ buildParsers kind exprNames = do
         -- level comes first.
         relatedOperators :: [(PrecedenceLevel, [NotationSection])]
         relatedOperators =
-          map (\((l, ns) : rest) -> (l, ns ++ concatMap snd rest)) .
-          List.groupBy ((==) `on` fst) .
-          List.sortBy (compare `on` fst) .
+          map (\((l, ns) :| rest) -> (l, ns ++ concatMap snd rest)) .
+          List1.groupOn fst .
           mapMaybe (\n -> case level n of
                             Unrelated     -> Nothing
                             r@(Related l) ->
@@ -367,8 +364,8 @@ buildParsers kind exprNames = do
               }
 
     -- Andreas, 2020-06-03 #4712
-    -- Note: needs Agda to be compiled with DEBUG to print the grammar.
-    reportSDoc "scope.grammar" 10 $ return $
+    -- Note: needs Agda to be compiled with DEBUG_PARSING to print the grammar.
+    reportSDoc "scope.grammar" 20 $ return $
       "Operator grammar:" $$ nest 2 (grammar (pTop g))
 
     return $ Parsers
@@ -563,8 +560,13 @@ instance Pretty ParseLHS where
 
 -- | Parses a left-hand side, workhorse for 'parseLHS'.
 --
-parseLHS'
-  :: LHSOrPatSyn
+parseLHS' ::
+     DisplayLHS
+       -- ^ Are we parsing a 'DisplayPragma'?
+       --   Then defined names are recognized as constructors.
+       --
+       --   In this case, 'LHSOrPatSyn' is 'IsLHS' and 'Maybe QName' is 'Just'.
+  -> LHSOrPatSyn
        -- ^ Are we trying to parse a lhs or a pattern synonym?
        --   For error reporting only!
   -> Maybe QName
@@ -573,13 +575,13 @@ parseLHS'
   -> Pattern
        -- ^ Thing to parse.
   -> ScopeM (ParseLHS, [NotationSection])
-       -- ^ The returned list contains all operators/notations/sections that
-       -- were used to generate the grammar.
+       -- ^ The returned list contains all operators\/notations\/sections that
+       --   were used to generate the grammar.
 
-parseLHS' IsLHS (Just qn) WildP{} =
+parseLHS' NoDisplayLHS IsLHS (Just qn) WildP{} =
     return (ParseLHS qn $ LHSHead qn [], [])
 
-parseLHS' lhsOrPatSyn top p = do
+parseLHS' displayLhs lhsOrPatSyn top p = do
 
     -- Build parser.
     patP <- buildParsers IsPattern (patternQNames p)
@@ -589,7 +591,7 @@ parseLHS' lhsOrPatSyn top p = do
                in  foldr seq () result `seq` result
 
     -- Classify parse results.
-    let cons = getNames (someKindsOfNames [ConName, CoConName, PatternSynName])
+    let cons = getNames (someKindsOfNames $ applyWhen displayLhs (defNameKinds ++) conLikeNameKinds)
                         (flattenedScope patP)
     let flds = getNames (someKindsOfNames [FldName])
                         (flattenedScope patP)
@@ -600,15 +602,15 @@ parseLHS' lhsOrPatSyn top p = do
       [ "Possible parses for lhs:" ] ++ map (nest 2 . pretty . snd) results
     case results of
         -- Unique result.
-        [(_,lhs)] -> do reportS "scope.operators" 50 $ "Parsed lhs:" <+> pretty lhs
-                        return (lhs, operators patP)
+        [(_,lhs)] -> (lhs, operators patP) <$ do
+                       reportS "scope.operators" 50 $ "Parsed lhs:" <+> pretty lhs
         -- No result.
-        []        -> typeError $ OperatorInformation (operators patP)
-                               $ NoParseForLHS lhsOrPatSyn (catMaybes errs) p
+        []        -> typeError $ OperatorInformation (operators patP) $
+                       NoParseForLHS lhsOrPatSyn (catMaybes errs) p
         -- Ambiguous result.
-        rs        -> typeError $ OperatorInformation (operators patP)
-                               $ AmbiguousParseForLHS lhsOrPatSyn p $
-                       map (fullParen . fst) rs
+        r0:r1:rs  -> typeError $ OperatorInformation (operators patP) $
+                       AmbiguousParseForLHS lhsOrPatSyn p $
+                         fmap (fullParen . fst) $ List2 r0 r1 rs
     where
         getNames kinds flat =
           map (notaName . List1.head) $ getDefinedNames kinds flat
@@ -692,9 +694,16 @@ classifyPattern conf p =
 
 
 -- | Parses a left-hand side, and makes sure that it defined the expected name.
-parseLHS :: QName -> Pattern -> ScopeM LHSCore
-parseLHS top p = billToParser IsPattern $ do
-  (res, ops) <- parseLHS' IsLHS (Just top) p
+parseLHS ::
+     DisplayLHS
+       -- ^ Are we parsing a 'DisplayPragma'?
+  -> QName
+       -- ^ Name of the definition.
+  -> Pattern
+       -- ^ Full left hand side.
+  -> ScopeM LHSCore
+parseLHS displayLhs top p = billToParser IsPattern $ do
+  (res, ops) <- parseLHS' displayLhs IsLHS (Just top) p
   case res of
     ParseLHS f lhs -> return lhs
     _ -> typeError $ OperatorInformation ops
@@ -709,7 +718,7 @@ parsePatternSyn = parsePatternOrSyn IsPatSyn
 
 parsePatternOrSyn :: LHSOrPatSyn -> Pattern -> ScopeM Pattern
 parsePatternOrSyn lhsOrPatSyn p = billToParser IsPattern $ do
-  (res, ops) <- parseLHS' lhsOrPatSyn Nothing p
+  (res, ops) <- parseLHS' NoDisplayLHS lhsOrPatSyn Nothing p
   case res of
     ParsePattern p -> return p
     _ -> typeError $ OperatorInformation ops
@@ -726,14 +735,34 @@ validConPattern
 validConPattern cons = loop
   where
   loop p = case appView p of
-      WithP _ p :| [] -> loop p
-      _ :| []         -> ok
-      IdentP _ x :| ps
-        | cons x      -> mapM_ loop ps
-        | otherwise   -> failure
-      QuoteP _ :| [_] -> ok
-      DotP _ e :| ps  -> mapM_ loop ps
-      _               -> failure
+
+      -- Eliminated by appView:
+      AppP{}      :| _   -> __IMPOSSIBLE__
+      OpAppP{}    :| _   -> __IMPOSSIBLE__
+      ParenP{}    :| _   -> __IMPOSSIBLE__
+      RawAppP{}   :| _   -> __IMPOSSIBLE__
+      HiddenP{}   :| _   -> __IMPOSSIBLE__
+      InstanceP{} :| _   -> __IMPOSSIBLE__
+
+      -- Hopeful cases:
+      WithP _ p   :| []  -> loop p
+      _           :| []  -> ok
+      IdentP _ x  :| ps
+        | cons x         -> mapM_ loop ps
+        | otherwise      -> failure
+      QuoteP _    :| [_] -> ok
+      DotP _ _ _  :| ps  -> mapM_ loop ps
+
+      -- Failures:
+      AbsurdP{}   :| _:_ -> failure
+      AsP{}       :| _:_ -> failure
+      EllipsisP{} :| _:_ -> failure
+      EqualP{}    :| _:_ -> failure
+      LitP{}      :| _:_ -> failure
+      QuoteP{}    :| _:_ -> failure
+      RecP{}      :| _:_ -> failure
+      WildP{}     :| _:_ -> failure
+      WithP{}     :| _:_ -> failure
     where
     ok      = return ()
     failure = throwError $ Just p
@@ -745,7 +774,7 @@ appView = loop []
   where
   loop acc = \case
     AppP p a         -> loop (namedArg a : acc) p
-    OpAppP _ op _ ps -> (IdentP True op :| fmap namedArg ps)
+    OpAppP _ op _ ps -> (IdentP True op <| fmap namedArg ps)
                           `List1.appendList`
                         reverse acc
     ParenP _ p       -> loop acc p
@@ -793,40 +822,33 @@ parseApplication es  = billToParser IsExpr $ do
                          $ AmbiguousParseForApplication es
                          $ fmap fullParen (e :| es')
 
-parseModuleIdentifier :: Expr -> ScopeM QName
-parseModuleIdentifier (Ident m) = return m
-parseModuleIdentifier e = typeError $ NotAModuleExpr e
+-- | Parse the arguments of a raw application with known head.
+--
+parseArguments ::
+     Expr                   -- ^ Head
+  -> [Expr]                 -- ^ Raw arguments
+  -> ScopeM [NamedArg Expr] -- ^ Operator-parsed arguments
+parseArguments hd = \case
+  [] -> return []
+  es@(e1 : rest) -> billToParser IsExpr $ do
 
-parseRawModuleApplication :: List2 Expr -> ScopeM (QName, [NamedArg Expr])
-parseRawModuleApplication es@(List2 e e2 rest) = billToParser IsExpr $ do
-    let es_args = e2:rest
-    m <- parseModuleIdentifier e
+    -- Form the raw application for error reporting
+    let es2 = List2 hd e1 rest
 
     -- Build the arguments parser
-    p <- buildParsers IsExpr [ q | Ident q <- es_args ]
+    p <- buildParsers IsExpr [ q | Ident q <- es ]
 
     -- Parse
     -- TODO: not sure about forcing
-    case {-force $-} argsParser p es_args of
-        [as] -> return (m, as)
+    case {-force $-} argsParser p es of
+        [as] -> return as
         []   -> typeError $ OperatorInformation (operators p)
-                          $ NoParseForApplication es
+                          $ NoParseForApplication es2
         as : ass -> do
-          let f = fullParen . foldl (App noRange) (Ident m)
+          let f = fullParen . foldl (App noRange) hd
           typeError $ OperatorInformation (operators p)
-                    $ AmbiguousParseForApplication es
+                    $ AmbiguousParseForApplication es2
                     $ fmap f (as :| ass)
-
--- | Parse an expression into a module application
---   (an identifier plus a list of arguments).
-parseModuleApplication :: Expr -> ScopeM (QName, [NamedArg Expr])
-parseModuleApplication (RawApp _ es) = parseRawModuleApplication es
-parseModuleApplication (App r e1 e2) = do -- TODO: do we need this case?
-    (m, args) <- parseModuleApplication e1
-    return (m, args ++ [e2])
-parseModuleApplication e = do
-    m <- parseModuleIdentifier e
-    return (m, [])
 
 ---------------------------------------------------------------------------
 -- * Inserting parenthesis

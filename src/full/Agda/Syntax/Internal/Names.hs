@@ -5,7 +5,6 @@
 module Agda.Syntax.Internal.Names where
 
 import Data.HashMap.Strict (HashMap)
-import qualified Data.HashMap.Strict as HMap
 import Data.Map (Map)
 import Data.Set (Set)
 
@@ -99,26 +98,34 @@ instance NamesIn a => NamesIn (Tele a)
 
 instance (NamesIn a, NamesIn b) => NamesIn (a, b) where
   namesAndMetasIn' sg (x, y) =
-    mappend (namesAndMetasIn' sg x) (namesAndMetasIn' sg y)
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y
+  {-# INLINE namesAndMetasIn' #-}
 
 instance (NamesIn a, NamesIn b, NamesIn c) => NamesIn (a, b, c) where
-  namesAndMetasIn' sg (x, y, z) = namesAndMetasIn' sg (x, (y, z))
+  namesAndMetasIn' sg (x, y, z) =
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z
+  {-# INLINE namesAndMetasIn' #-}
 
 instance (NamesIn a, NamesIn b, NamesIn c, NamesIn d) => NamesIn (a, b, c, d) where
   namesAndMetasIn' sg (x, y, z, u) =
-    namesAndMetasIn' sg ((x, y), (z, u))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+  {-# INLINE namesAndMetasIn' #-}
 
 instance
   (NamesIn a, NamesIn b, NamesIn c, NamesIn d, NamesIn e) =>
   NamesIn (a, b, c, d, e) where
   namesAndMetasIn' sg (x, y, z, u, v) =
-    namesAndMetasIn' sg ((x, y), (z, (u, v)))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+    <> namesAndMetasIn' sg v
+  {-# INLINE namesAndMetasIn' #-}
 
 instance
   (NamesIn a, NamesIn b, NamesIn c, NamesIn d, NamesIn e, NamesIn f) =>
   NamesIn (a, b, c, d, e, f) where
   namesAndMetasIn' sg (x, y, z, u, v, w) =
-    namesAndMetasIn' sg ((x, (y, z)), (u, (v, w)))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+    <> namesAndMetasIn' sg v <> namesAndMetasIn' sg w
+  {-# INLINE namesAndMetasIn' #-}
 
 instance NamesIn CompKit where
   namesAndMetasIn' sg (CompKit a b) = namesAndMetasIn' sg (a,b)
@@ -143,18 +150,18 @@ instance NamesIn Bool where
 
 instance NamesIn Definition where
   namesAndMetasIn' sg
-    (Defn _ _ t _ _ _ _ disp _ _ _ _ _ _ _ _ _ _ def) =
+    (Defn _ _ t _ _ _ disp _ _ _ _ _ _ _ _ _ _ def) =
     namesAndMetasIn' sg (t, def, disp)
 
 instance NamesIn Defn where
   namesAndMetasIn' sg = \case
     Axiom _            -> mempty
     DataOrRecSig _     -> mempty
-    GeneralizableVar   -> mempty
+    GeneralizableVar _ -> mempty
     PrimitiveSort _ s  -> namesAndMetasIn' sg s
     AbstractDefn{}     -> __IMPOSSIBLE__
     -- Andreas 2017-07-27, Q: which names can be in @cc@ which are not already in @cl@?
-    Function cl cc _ _ _ _ _ _ _ _ _ _ el _ _ _
+    Function cl cc _ _ _ _ _ _ _ _ el _ _ _
       -> namesAndMetasIn' sg (cl, cc, el)
     Datatype _ _ cl cs s _ _ _ trX trD
       -> namesAndMetasIn' sg (cl, cs, s, trX, trD)
@@ -166,7 +173,7 @@ instance NamesIn Defn where
       -> namesAndMetasIn' sg (cl, cc)
 
 instance NamesIn Clause where
-  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _ _) =
+  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _) =
     namesAndMetasIn' sg (tel, ps, b, t)
 
 instance NamesIn CompiledClauses where
@@ -185,7 +192,7 @@ instance NamesIn (Pattern' a) where
     VarP _ _        -> mempty
     LitP _ l        -> namesAndMetasIn' sg l
     DotP _ v        -> namesAndMetasIn' sg v
-    ConP c _ args   -> namesAndMetasIn' sg (c, args)
+    ConP c cpi args -> namesAndMetasIn' sg (c, cpi, args)
     DefP o q args   -> namesAndMetasIn' sg (q, args)
     ProjP _ f       -> namesAndMetasIn' sg f
     IApplyP _ t u _ -> namesAndMetasIn' sg (t, u)
@@ -308,7 +315,7 @@ instance NamesIn RewriteRule where
       namesAndMetasIn' sg (a, b, c, d, e, f)
 
 instance (NamesIn a, NamesIn b) => NamesIn (HashMap a b) where
-  namesAndMetasIn' sg = namesAndMetasIn' sg . HMap.toList
+  namesAndMetasIn' sg map = foldMap (namesAndMetasIn' sg) map
 
 instance NamesIn System where
   namesAndMetasIn' sg (System tel cs) = namesAndMetasIn' sg (tel, cs)
@@ -366,6 +373,9 @@ newtype PSyn = PSyn A.PatternSynDefn
 instance NamesIn PSyn where
   namesAndMetasIn' sg (PSyn (_args, p)) = namesAndMetasIn' sg p
 
+instance NamesIn ConPatternInfo where
+  namesAndMetasIn' sg (ConPatternInfo _ _ _ ty _) = namesAndMetasIn' sg ty
+
 instance NamesIn (A.Pattern' a) where
   namesAndMetasIn' sg = \case
     A.VarP _               -> mempty
@@ -381,7 +391,6 @@ instance NamesIn (A.Pattern' a) where
     A.DotP{}               -> __IMPOSSIBLE__    -- Dot patterns are not allowed in pattern synonyms
     A.EqualP{}             -> __IMPOSSIBLE__    -- Andrea: should we allow these in pattern synonyms?
     A.WithP _ p            -> namesAndMetasIn' sg p
-    A.AnnP _ a p           -> __IMPOSSIBLE__    -- Type annotations are not (yet) allowed in pattern synonyms
 
 instance NamesIn AmbiguousQName where
   namesAndMetasIn' sg (AmbQ cs) = namesAndMetasIn' sg cs

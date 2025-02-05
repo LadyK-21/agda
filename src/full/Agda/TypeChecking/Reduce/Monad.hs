@@ -1,5 +1,5 @@
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -Wunused-imports #-}
-
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Agda.TypeChecking.Reduce.Monad
@@ -11,22 +11,20 @@ module Agda.TypeChecking.Reduce.Monad
 
 import Prelude hiding (null)
 
-import Control.Monad         ( liftM2 )
-
 import qualified Data.Map as Map
 import Data.Maybe
 
 import System.IO.Unsafe
 
+import Agda.Syntax.Common.Pretty () --instance only
 import Agda.Syntax.Internal
+
 import Agda.TypeChecking.Monad hiding (enterClosure, constructorForm)
 import Agda.TypeChecking.Substitute
 
 import Agda.Utils.Lens
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
-import Agda.Syntax.Common.Pretty () --instance only
-
 
 instance HasBuiltins ReduceM where
   getBuiltinThing b =
@@ -86,8 +84,13 @@ instance MonadDebug ReduceM where
       (s , _) <- runTCM env st $ formatDebugMessage k n d
       return $ return s
 
+#ifdef DEBUG
   verboseBracket k n s = applyWhenVerboseS k n $
     bracket_ (openVerboseBracket k n s) (const $ closeVerboseBracket k n)
+#else
+  verboseBracket k n s ma = ma
+  {-# INLINE verboseBracket #-}
+#endif
 
   getVerbosity      = defaultGetVerbosity
   getProfileOptions = defaultGetProfileOptions

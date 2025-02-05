@@ -1,5 +1,4 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ViewPatterns        #-}
 {-# LANGUAGE TypeApplications    #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -21,7 +20,6 @@ module Agda.TypeChecking.Substitute
   ) where
 
 import Control.Arrow (first, second)
-import Control.Monad (guard)
 
 import Data.Coerce
 import Data.Function (on)
@@ -49,6 +47,7 @@ import Agda.TypeChecking.Substitute.DeBruijn
 
 import Agda.Utils.Either
 import Agda.Utils.Empty
+import Agda.Utils.Function (applyWhen)
 import Agda.Utils.Functor
 import Agda.Utils.List
 import Agda.Utils.List1 (List1, pattern (:|))
@@ -109,7 +108,7 @@ canProject f v =
     -- Andreas, 2022-06-10, issue #5922: also unfold data projections
     -- (not just record projections).
     (Con (ConHead _ _ _ fs) _ vs) -> do
-      (fld, i) <- findWithIndex ((f==) . unArg) fs
+      (fld, i) <- findWithIndex ((f ==) . unArg) fs
       -- Jesper, 2019-10-17: dont unfold irrelevant projections
       guard $ not $ isIrrelevant fld
       -- Andreas, 2018-06-12, issue #2170
@@ -136,7 +135,7 @@ conApp fallback ch@(ConHead c _ _ fs) ci args ees@(Proj o f : es) =
       app :: Term -> Elims -> Term
       app v es = coerce $ applyE (coerce v :: t) es
   in
-   case findWithIndex ((f==) . unArg) fs of
+   case findWithIndex ((f ==) . unArg) fs of
      Nothing -> failure $ stuck __IMPOSSIBLE__ `app` es
      Just (fld, i) -> let
       -- Andreas, 2018-06-12, issue #2170
@@ -187,9 +186,7 @@ argToDontCare :: Arg Term -> Term
 argToDontCare (Arg ai v) = relToDontCare ai v
 
 relToDontCare :: LensRelevance a => a -> Term -> Term
-relToDontCare ai v
-  | Irrelevant <- getRelevance ai = dontCare v
-  | otherwise                     = v
+relToDontCare ai = applyWhen (isIrrelevant ai) dontCare
 
 -- Andreas, 2016-01-19: In connection with debugging issue #1783,
 -- I consider the Apply instance for Type harmful, as piApply is not
@@ -233,8 +230,8 @@ instance TermSubst a => Apply (Tele a) where
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
 instance Apply Definition where
-  apply (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) args =
-    Defn info x (piApply t args) (apply pol args) (apply occ args) (apply gens args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
+  apply (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) args =
+    Defn info x (piApply t args) (apply pol args) (apply occ args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
 
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
@@ -303,7 +300,7 @@ instance Apply Defn where
   apply d args@(arg1:args1) = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (n - length args)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ apply gv args
     AbstractDefn d -> AbstractDefn $ apply d args
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -367,7 +364,7 @@ instance Apply Clause where
     -- It is assumed that we only apply a clause to "parameters", i.e.
     -- arguments introduced by lambda lifting. The problem is that these aren't
     -- necessarily the first elements of the clause telescope.
-    apply cls@(Clause rl rf tel ps b t catchall exact recursive unreachable ell wm) args
+    apply cls@(Clause rl rf tel ps b t catchall recursive unreachable ell wm) args
       | length args > length ps = __IMPOSSIBLE__
       | otherwise =
       Clause rl rf
@@ -376,7 +373,6 @@ instance Apply Clause where
              (applySubst rho b)
              (applySubst rho t)
              catchall
-             exact
              recursive
              unreachable
              ell
@@ -624,8 +620,8 @@ instance Abstract Telescope where
   ExtendTel arg xtel `abstract` tel = ExtendTel arg $ xtel <&> (`abstract` tel)
 
 instance Abstract Definition where
-  abstract tel (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) =
-    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ) (abstract tel gens)
+  abstract tel (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) =
+    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ)
       (replicate (size tel) Nothing ++ gpars)
       df m c inst copy ma nc inj copat blk lang (abstract tel d)
 
@@ -665,7 +661,7 @@ instance Abstract Defn where
   abstract tel d = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (size tel + n)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ abstract tel gv
     AbstractDefn d -> AbstractDefn $ abstract tel d
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -721,13 +717,12 @@ instance Abstract PrimFun where
         where n = size tel
 
 instance Abstract Clause where
-  abstract tel (Clause rl rf tel' ps b t catchall exact recursive unreachable ell wm) =
+  abstract tel (Clause rl rf tel' ps b t catchall recursive unreachable ell wm) =
     Clause rl rf (abstract tel tel')
            (namedTelVars m tel ++ ps)
            b
            t -- nothing to do for t, since it lives under the telescope
            catchall
-           exact
            recursive
            unreachable
            ell
@@ -854,6 +849,10 @@ applySubstTerm rho t    = coerce $ case coerce t of
 instance Subst Term where
   type SubstArg Term = Term
   applySubst = applySubstTerm
+
+-- András 2023-09-25: we can only put this here, because at the original definition site there's no Subst Term instance.
+{-# SPECIALIZE lookupS :: Substitution' Term -> Nat -> Term #-}
+{-# SPECIALIZE isNoAbs :: Abs Term -> Maybe Term #-}
 
 instance Subst BraveTerm where
   type SubstArg BraveTerm = BraveTerm
@@ -1027,6 +1026,7 @@ instance Subst Constraint where
     IsEmpty r a              -> IsEmpty r (rf a)
     CheckSizeLtSat t         -> CheckSizeLtSat (rf t)
     FindInstance m cands     -> FindInstance m (rf cands)
+    ResolveInstanceHead q    -> ResolveInstanceHead (rf q)
     c@UnBlock{}              -> c
     c@CheckFunDef{}          -> c
     HasBiggerSort s          -> HasBiggerSort (rf s)
@@ -1074,16 +1074,24 @@ instance (Subst a, Subst b, SubstArg a ~ SubstArg b) => Subst (Dom' a b) where
   applySubst IdS dom = dom
   applySubst rho dom = setFreeVariables unknownFreeVariables $
     fmap (applySubst rho) dom{ domTactic = applySubst rho (domTactic dom) }
+  {-# INLINABLE applySubst #-}
 
 instance Subst LetBinding where
   type SubstArg LetBinding = Term
   applySubst rho (LetBinding o v t) = LetBinding o (applySubst rho v) (applySubst rho t)
+
+instance Subst ContextEntry where
+  type SubstArg ContextEntry = Term
+  applySubst rho (CtxVar x a)   = CtxVar x $ applySubst rho a
 
 instance Subst a => Subst (Maybe a) where
   type SubstArg (Maybe a) = SubstArg a
 
 instance Subst a => Subst [a] where
   type SubstArg [a] = SubstArg a
+
+instance Subst a => Subst (List1 a) where
+  type SubstArg (List1 a) = SubstArg a
 
 instance (Ord k, Subst a) => Subst (Map k a) where
   type SubstArg (Map k a) = SubstArg a
@@ -1397,6 +1405,8 @@ deriving instance Eq NotBlocked
 deriving instance Eq t => Eq (Blocked t)
 deriving instance Eq CandidateKind
 deriving instance Eq Candidate
+deriving instance Ord CandidateKind
+deriving instance Ord Candidate
 
 deriving instance (Subst a, Eq a)  => Eq  (Tele a)
 deriving instance (Subst a, Ord a) => Ord (Tele a)

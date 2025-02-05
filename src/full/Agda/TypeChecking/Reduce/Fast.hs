@@ -394,7 +394,7 @@ fastCase env (Branches proj con _ lit wild fT _) =
     , fconBranches    = Map.mapKeysMonotonic (nameId . qnameName) $ fmap (fastCompiledClauses env . content) (stripSuc con)
     , fsucBranch      = fmap (fastCompiledClauses env . content) $ flip Map.lookup con . conName =<< bSuc env
     , flitBranches    = fmap (fastCompiledClauses env) lit
-    , ffallThrough    = (Just True ==) fT
+    , ffallThrough    = Just True == fT
     , fcatchAllBranch = fmap (fastCompiledClauses env) wild }
   where
     stripSuc | Just c <- bSuc env = Map.delete (conName c)
@@ -466,9 +466,6 @@ fastReduce' norm v = do
                    else return []
     compactDef bEnv info rewr
   ReduceM $ \ redEnv -> reduceTm redEnv bEnv (memoQName constInfo) norm v
-
-unKleisli :: (a -> ReduceM b) -> ReduceM (a -> b)
-unKleisli f = ReduceM $ \ env x -> unReduceM (f x) env
 
 -- * Closures
 
@@ -989,8 +986,7 @@ reduceTm rEnv bEnv !constInfo normalisation =
               spine' <- elimsToSpine env es
               let (zs, env, !spine'') = buildEnv (instTel i) (spine' <> spine)
               runAM (evalClosure (lams zs (instBody i)) env spine'' ctrl)
-            Just Open{}                         -> __IMPOSSIBLE__
-            Just OpenInstance{}                 -> __IMPOSSIBLE__
+            Just OpenMeta{}                     -> __IMPOSSIBLE__
             Just BlockedConst{}                 -> __IMPOSSIBLE__
             Just PostponedTypeCheckingProblem{} -> __IMPOSSIBLE__
 

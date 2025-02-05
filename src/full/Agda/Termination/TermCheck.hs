@@ -1,4 +1,3 @@
-{-# LANGUAGE GADTs                      #-}
 
 {-# LANGUAGE ImplicitParams             #-}
 {-# LANGUAGE NondecreasingIndentation   #-}
@@ -171,7 +170,7 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
   -- The following debug statement is part of a test case for Issue
   -- #3590.
   reportSLn "term.mutual.id" 40 $
-    "Termination checking mutual block " ++ show mid
+    "Termination checking mutual block " ++ prettyShow mid
   reportSLn "term.mutual" 10 $ "Termination checking " ++ prettyShow allNames
 
   -- NO_TERMINATION_CHECK
@@ -255,7 +254,7 @@ termMutual' = do
        -- could be turned into actual splits, because no-confusion
        -- would make the other cases impossible, so I do not disable
        -- this for --without-K entirely.
-       ifM (isJust . optCubical <$> pragmaOptions) (return r) {- else -} $
+       ifM (isJust <$> cubicalOption) (return r) {- else -} $
        case r of
          r@Right{} -> return r
          Left{}    -> do
@@ -414,7 +413,7 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
      -- this for --without-K entirely.
      --
      -- Andreas, 2022-03-21: The check for --cubical was missing here.
-     ifM (isJust . optCubical <$> pragmaOptions) (return r) {- else -} $ case r of
+     ifM (isJust <$> cubicalOption) (return r) {- else -} $ case r of
        Right () -> return $ Right ()
        Left{}   -> do
          -- Try again, but include the dot patterns this time.
@@ -436,7 +435,7 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
           Record{} -> do
             reportSDoc "term.warn.no" 10 $ vcat $
               hsep [ "Record type", prettyTCM name, "does not termination check.", "Problematic calls:" ] :
-              (map (nest 2 . prettyTCM) $ List.sortOn getRange calls)
+              map (nest 2 . prettyTCM) (List.sortOn getRange calls)
             mempty
 
           -- Functions must terminate, so we report the error.
@@ -536,8 +535,8 @@ termRecTel npars tel = do
       extract $ telFromList fields
   where
   -- create n variable patterns
-  mkPats n  = zipWith mkPat (downFrom n) <$> getContextNames
-  mkPat i x = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
+  mkPats n  = map mkPat <$> getContextVars
+  mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
 -- | Collect calls in type signature @f : (x1:A1)...(xn:An) -> B@.
 --   It is treated as if there were the additional function clauses.
@@ -565,8 +564,8 @@ termType = return mempty
         extract dom `mappend` underAbstractionAbs dom absB (loop $! n + 1)
 
   -- create n variable patterns
-  mkPats n  = zipWith mkPat (downFrom n) <$> getContextNames
-  mkPat i x = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
+  mkPats n  = map mkPat <$> getContextVars
+  mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
 -- | Mask arguments and result for termination checking
 --   according to type of function.
@@ -976,15 +975,17 @@ tryReduceNonRecursiveClause g es continue fallback = do
   ifM (notElem g <$> terGetMutual) fallback {-else-} $ do
   reportSLn "term.reduce" 40 $ "This call is in the current SCC!"
 
-  -- Then, collect its non-recursive clauses.
-  cls <- liftTCM $ getNonRecursiveClauses g
-  reportSLn "term.reduce" 40 $ unwords [ "Function has", show (length cls), "non-recursive exact clauses"]
+  -- Then, collect its clauses.
+  cls <- defClauses <$> getConstInfo g
+  reportSLn "term.reduce" 40 $ unwords [ "Function has", show (length cls), "clauses"]
   reportSDoc "term.reduce" 80 $ vcat $ map (prettyTCM . NamedClause g True) cls
   reportSLn  "term.reduce" 80 . ("allowed reductions = " ++) . show . SmallSet.elems
     =<< asksTC envAllowedReductions
 
   -- Finally, try to reduce with the non-recursive clauses (and no rewrite rules).
-  r <- liftTCM $ modifyAllowedReductions (SmallSet.delete UnconfirmedReductions) $
+  r <- liftTCM $
+    modifyAllowedReductions (SmallSet.delete UnconfirmedReductions) $
+    localTC (\e -> e { envTermCheckReducing = True }) $
     runReduceM $ appDefE' g v0 cls [] (map notReduced es)
   case r of
     NoReduction{}    -> fallback
@@ -995,13 +996,6 @@ tryReduceNonRecursiveClause g es continue fallback = do
         ]
       verboseS "term.reduce" 5 $ tick "termination-checker-reduced-nonrecursive-call"
       continue v
-
-getNonRecursiveClauses :: QName -> TCM [Clause]
-getNonRecursiveClauses q =
-  filter (liftA2 (&&) nonrec exact) . defClauses <$> getConstInfo q
-  where
-  nonrec = maybe False not . clauseRecursive
-  exact  = fromMaybe False . clauseExact
 
 -- | Extract recursive calls from a term.
 
@@ -1034,10 +1028,10 @@ instance ExtractCalls Term where
           caseMaybeM (isRecordConstructor c) inductive $ \ (q, def) -> do
             reportSLn "term.check.term" 50 $ "constructor " ++ prettyShow c ++ " has record type " ++ prettyShow q
             -- inductive record constructors are not guarding
-            if recInduction def /= Just CoInductive then inductive else do
+            if _recInduction def /= Just CoInductive then inductive else do
             -- coinductive constructors unrelated to the mutually
             -- constructed inhabitants of coinductive types are not guarding
-            ifM (targetElem . fromMaybe __IMPOSSIBLE__ $ recMutual def)
+            ifM (targetElem . fromMaybe __IMPOSSIBLE__ $ _recMutual def)
                {-then-} coinductive
                {-else-} inductive
         constructor c ind argsg
@@ -1217,7 +1211,7 @@ compareProj d d'
           case def of
             Record{ recFields = fs } -> do
               fs <- return $ map unDom fs
-              case (List.find (d==) fs, List.find (d'==) fs) of
+              case (List.find (d ==) fs, List.find (d' ==) fs) of
                 (Just i, Just i')
                   -- earlier field is smaller
                   | i < i'    -> return Order.lt
@@ -1317,7 +1311,7 @@ instance StripAllProjections Term where
         -- c <- fromRightM (\ err -> return c) $ getConForm (conName c)
         Con c ci <$> stripAllProjections ts
       Def d es   -> Def d <$> stripAllProjections es
-      DontCare t -> DontCare <$> stripAllProjections t
+      DontCare t -> stripAllProjections t
       _ -> return t
 
 -- | Normalize outermost constructor name in a pattern.
@@ -1344,7 +1338,8 @@ compareTerm' v mp@(Masked m p) = do
     (Var i es, _) | Just{} <- allApplyElims es ->
       compareVar i mp
 
-    (DontCare t, _) -> pure Order.unknown
+    (DontCare t, _) ->
+      compareTerm' t mp
 
     -- Andreas, 2014-09-22, issue 1281:
     -- For metas, termination checking should be optimistic.

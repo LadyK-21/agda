@@ -44,7 +44,7 @@ prop_cluster_sound (Fun _ f) as =
   (`all` [ (c, d) | let cs = cluster f as, c <- cs, d <- cs, c /= d]) $ \ (c, d) ->
   (`all` c) $ \ a ->
   (`all` d) $ \ b ->
-  null $ (NonEmpty.toList $ f a) `intersect` (NonEmpty.toList $ f b)
+  null $ NonEmpty.toList (f a) `intersect` NonEmpty.toList (f b)
 
 isSingleton, exactlyTwo, atLeastTwo :: Foldable t => t a -> Bool
 isSingleton x = Fold.length x == 1
@@ -63,9 +63,9 @@ prop_cluster_single :: a -> [a] -> Bool
 prop_cluster_single a as =
   isSingleton $ cluster (const (0 :| [])) $ (a:as)
 
-prop_cluster_idem :: Fun a (NonEmpty C) -> a -> [a] -> Bool
-prop_cluster_idem (Fun _ f) a as =
-  isSingleton $ cluster f $ NonEmpty.toList $ head $ cluster f (a:as)
+prop_cluster_idem :: Fun a (NonEmpty C) -> NonEmpty a -> Bool
+prop_cluster_idem (Fun _ f) as =
+  isSingleton $ cluster1 f $ NonEmpty.head $ cluster1 f as
 
 prop_two_clusters :: [Int] -> Bool
 prop_two_clusters as =

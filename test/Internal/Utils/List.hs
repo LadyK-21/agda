@@ -1,14 +1,13 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE CPP             #-}
 
-#if  __GLASGOW_HASKELL__ > 800
 {-# OPTIONS_GHC -Wno-error=missing-signatures #-}
-#endif
-{-# OPTIONS_GHC -fno-warn-missing-signatures #-}
+{-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 module Internal.Utils.List ( tests ) where
 
 import Agda.Utils.List
+import qualified Agda.Utils.List1 as List1
 
 import Data.Bifunctor (first)
 import Data.Either (partitionEithers)
@@ -55,6 +54,12 @@ prop_partitionMaybe f as = partitionMaybe f as == partitionEithers (map f' as)
 prop_mapMaybeAndRest_Nothing as = mapMaybeAndRest (const Nothing) as == ([] :: [Int],as)
 prop_mapMaybeAndRest_Just    as = mapMaybeAndRest Just            as == (as,[])
 
+-- These properties hold only if @marker@ and @xs@ do not overlap.
+-- Problematic case: @dropFrom "aba" ("ab" ++ "aba" ++ "") /= "ab"@
+--
+-- prop_dropFrom_marker    marker xs ys = isSubsequenceOf (List1.toList marker) xs || dropFrom marker (xs ++ List1.toList marker ++ ys) == xs
+-- prop_dropFrom_no_marker marker xs    = isSubsequenceOf (List1.toList marker) xs || dropFrom marker xs == xs
+
 prop_stripSuffix_sound    suf xs  = maybe True (\ pre -> xs == pre ++ suf) $ stripSuffix suf xs
 prop_stripSuffix_complete pre suf = stripSuffix suf (pre ++ suf) == Just pre
 
@@ -93,19 +98,6 @@ prop_allDuplicates xs = allDuplicates xs `sameList` sort (xs \\ nub xs)
   where
   sameList xs ys = and $ zipWith same xs ys
   same (Decorate i a) (Decorate j b) = i == j && a == b
-
-prop_groupBy' :: (Bool -> Bool -> Bool) -> [Bool] -> Property
-prop_groupBy' p xs =
-  classify (length xs - length gs >= 3) "interesting" $
-    concat gs == xs
-    &&
-    and [not (null zs) | zs <- gs]
-    &&
-    and [and (pairInitTail zs zs) | zs <- gs]
-    &&
-    (null gs || not (or (pairInitTail (map last gs) (map head gs))))
-  where gs = groupBy' p xs
-        pairInitTail xs ys = zipWith p (init xs) (tail ys)
 
 prop_genericElemIndex :: Integer -> [Integer] -> Property
 prop_genericElemIndex x xs =
@@ -168,17 +160,17 @@ prop_uniqOn1 f xs = uniqOn f xs == sortBy (compare `on` f) (nubBy ((==) `on` f) 
 
 prop_commonPrefix :: [Integer] -> [Integer] -> [Integer] -> Bool
 prop_commonPrefix xs ys zs =
-  and [ isPrefixOf zs zs'
-      , isPrefixOf zs' (zs ++ xs)
-      , isPrefixOf zs' (zs ++ ys) ]
+  and [ zs `isPrefixOf` zs'
+      , zs' `isPrefixOf` (zs ++ xs)
+      , zs' `isPrefixOf` (zs ++ ys) ]
   where
     zs' = commonPrefix (zs ++ xs) (zs ++ ys)
 
 prop_commonSuffix :: [Integer] -> [Integer] -> [Integer] -> Bool
 prop_commonSuffix xs ys zs =
-  and [ isSuffixOf zs zs'
-      , isSuffixOf zs' (xs ++ zs)
-      , isSuffixOf zs' (ys ++ zs) ]
+  and [ zs `isSuffixOf` zs'
+      , zs' `isSuffixOf` (xs ++ zs)
+      , zs' `isSuffixOf` (ys ++ zs) ]
   where
     zs' = commonSuffix (xs ++ zs) (ys ++ zs)
 

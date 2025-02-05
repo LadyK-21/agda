@@ -97,6 +97,7 @@ type BlockingVars = [BlockingVar]
 --   clause to match 'SplitClause'.
 type SplitInstantiation = [(Nat,SplitPattern)]
 
+{-# SPECIALIZE match :: [Clause] -> [NamedArg SplitPattern] -> TCM (Match (Nat, SplitInstantiation)) #-}
 -- | Match the given patterns against a list of clauses.
 --
 -- If successful, return the index of the covering clause.
@@ -209,6 +210,7 @@ instance Subst SplitPattern where
         p -> p
 
 
+{-# SPECIALIZE isTrivialPattern :: Pattern' a -> TCM Bool #-}
 -- | A pattern that matches anything (modulo eta).
 isTrivialPattern :: (HasConstInfo m) => Pattern' a -> m Bool
 isTrivialPattern = \case
@@ -308,8 +310,7 @@ choice m m' = m >>= \case
     No         -> return $ Block r xs
   No    -> m'
 
--- | @matchClause qs i c@ checks whether clause @c@
---   covers a split clause with patterns @qs@.
+{-# SPECIALIZE matchClause :: [NamedArg SplitPattern] -> Clause -> TCM MatchResult #-}
 matchClause
   :: PureTCM m
   => [NamedArg SplitPattern]
@@ -321,7 +322,7 @@ matchClause
      --   If 'Yes' the instantiation @rs@ such that @(namedClausePats c)[rs] == qs@.
 matchClause qs c = matchPats (namedClausePats c) qs
 
-
+{-# SPECIALIZE matchPats :: DeBruijn a => [NamedArg (Pattern' a)] -> [NamedArg SplitPattern] -> TCM MatchResult #-}
 -- | @matchPats ps qs@ checks whether a function clause with patterns
 --   @ps@ covers a split clause with patterns @qs@.
 --
@@ -389,6 +390,7 @@ combine m m' = m >>= \case
       Block s ys -> return $ Block (anyBlockedOnResult r s) (xs ++ ys)
       Yes{} -> return x
 
+{-# SPECIALIZE matchPat :: DeBruijn a => Pattern' a -> SplitPattern -> TCM MatchResult #-}
 -- | @matchPat p q@ checks whether a function clause pattern @p@
 --   covers a split clause pattern @q@.  There are three results:
 --
@@ -462,6 +464,7 @@ matchPat p q = case p of
     ProjP{}   -> __IMPOSSIBLE__  -- excluded by typing
     IApplyP _ _ _ x -> __IMPOSSIBLE__ -- blockedOnConstructor (splitPatVarIndex x) c
 
+{-# SPECIALIZE unDotP :: DeBruijn a => Pattern' a -> TCM (Pattern' a) #-}
 -- | Unfold one level of a dot pattern to a proper pattern if possible.
 unDotP :: (MonadReduce m, DeBruijn a) => Pattern' a -> m (Pattern' a)
 unDotP (DotP o v) = reduce v >>= \case
@@ -473,19 +476,20 @@ unDotP (DotP o v) = reduce v >>= \case
   v     -> return $ dotP v
 unDotP p = return p
 
+{-# SPECIALIZE isLitP :: Pattern' a -> TCM (Maybe Literal) #-}
 isLitP :: PureTCM m => Pattern' a -> m (Maybe Literal)
 isLitP (LitP _ l) = return $ Just l
 isLitP (DotP _ u) = reduce u >>= \case
   Lit l -> return $ Just l
   _ -> return $ Nothing
 isLitP (ConP c ci []) = do
-  Con zero _ [] <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinZero
-  if c == zero
+  zero <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinZero
+  if conName c == zero
     then return $ Just $ LitNat 0
     else return Nothing
 isLitP (ConP c ci [a]) | visible a && isRelevant a = do
-  Con suc _ [] <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSuc
-  if c == suc
+  suc <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinSuc
+  if conName c == suc
     then fmap inc <$> isLitP (namedArg a)
     else return Nothing
   where
@@ -494,13 +498,17 @@ isLitP (ConP c ci [a]) | visible a && isRelevant a = do
     inc _ = __IMPOSSIBLE__
 isLitP _ = return Nothing
 
+{-# SPECIALIZE unLitP :: Pattern' a -> TCM (Pattern' a) #-}
 unLitP :: HasBuiltins m => Pattern' a -> m (Pattern' a)
 unLitP (LitP info l@(LitNat n)) | n >= 0 = do
-  Con c ci es <- constructorForm' (fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinZero)
-                                  (fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSuc)
-                                  (Lit l)
-  let toP (Apply (Arg i (Lit l))) = Arg i (LitP info l)
-      toP _ = __IMPOSSIBLE__
-      cpi   = noConPatternInfo { conPInfo = info }
-  return $ ConP c cpi $ map (fmap unnamed . toP) es
+ constructorForm'
+   (fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinZero)
+   (fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSuc)
+   (Lit l) >>= \case
+  Con c ci es -> do
+    let toP (Apply (Arg i (Lit l))) = Arg i (LitP info l)
+        toP _ = __IMPOSSIBLE__
+        cpi   = noConPatternInfo { conPInfo = info }
+    return $ ConP c cpi $ map (fmap unnamed . toP) es
+  _ -> __IMPOSSIBLE__
 unLitP p = return p

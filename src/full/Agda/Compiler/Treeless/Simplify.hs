@@ -163,7 +163,7 @@ simplify FunctionKit{..} = simpl
           k = length lets
       return $ case u of
         TCase y _ d' bs' | x + k == y ->
-          mkLets lets $ TCase y t d' $ raise k bs ++ bs'
+          mkLets lets $ TCase y t d' $ raise k bs ++ filter (`noOverlap` bs) bs'
         _ -> e
     unchainCase e = return e
 
@@ -218,7 +218,7 @@ simplify FunctionKit{..} = simpl
         k == j = tOp PLt v u
       | Just (PAdd, k, v) <- constArithView v,
         TApp (TPrim P64ToI) [u] <- u,
-        k >= 2^64, Just trueCon <- true = TCon trueCon
+        k >= 2 ^ 64, Just trueCon <- true = TCon trueCon
       | Just k <- intView u
       , Just j <- intView v
       , Just trueCon <- true
@@ -358,7 +358,7 @@ simplify FunctionKit{..} = simpl
         d' <- lookupIfVar d
         case d' of
           TCase y _ d bs'' | x == y ->
-            tCase x t d (bs' ++ filter noOverlap bs'')
+            tCase x t d (bs' ++ filter (`noOverlap` bs') bs'')
           _ -> tCase' x t d bs'
       where
         bs' = filter (not . isUnreachable) bs
@@ -366,10 +366,11 @@ simplify FunctionKit{..} = simpl
         lookupIfVar (TVar i) = lookupVar i
         lookupIfVar t = pure t
 
-        noOverlap b = not $ any (overlapped b) bs'
-        overlapped (TACon c _ _)  (TACon c' _ _) = c == c'
-        overlapped (TALit l _)    (TALit l' _)   = l == l'
-        overlapped _              _              = False
+    noOverlap b bs = not $ any (overlapped b) bs
+
+    overlapped (TACon c _ _)  (TACon c' _ _) = c == c'
+    overlapped (TALit l _)    (TALit l' _)   = l == l'
+    overlapped _              _              = False
 
     -- Drop unreachable cases for Nat and Int cases.
     pruneLitCases :: Int -> CaseInfo -> TTerm -> [TAlt] -> S TTerm
@@ -458,7 +459,7 @@ simplify FunctionKit{..} = simpl
           literal _ _ = False
 
           -- k + fromWord x ≤ y  if  k + 2^64 - 1 ≤ y
-          wordUpperBound (k, [Pos (TApp (TPrim P64ToI) _)]) y = go (k + 2^64 - 1, []) y
+          wordUpperBound (k, [Pos (TApp (TPrim P64ToI) _)]) y = go (k + 2 ^ 64 - 1, []) y
           wordUpperBound _ _ = False
 
           -- x ≤ k + fromWord y  if  x ≤ k

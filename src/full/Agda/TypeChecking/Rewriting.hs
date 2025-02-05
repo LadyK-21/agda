@@ -1,5 +1,4 @@
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE GADTs #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
@@ -46,8 +45,9 @@ module Agda.TypeChecking.Rewriting where
 
 import Prelude hiding (null)
 
-import Control.Monad
+import Control.Monad.Trans.Maybe ( MaybeT(..), runMaybeT )
 
+import Data.Either (partitionEithers)
 import Data.Foldable (toList)
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
@@ -60,6 +60,8 @@ import Agda.Interaction.Options
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
+import Agda.Syntax.Internal.MetaVars
+import Agda.Syntax.Internal.Pattern
 
 import Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.Monad
@@ -80,6 +82,7 @@ import Agda.Utils.List
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
+import qualified Agda.Utils.Set1 as Set1
 import Agda.Utils.Size
 import qualified Agda.Utils.SmallSet as SmallSet
 
@@ -97,22 +100,17 @@ requireOptionRewriting =
 verifyBuiltinRewrite :: Term -> Type -> TCM ()
 verifyBuiltinRewrite v t = do
   requireOptionRewriting
-  let failure reason = typeError . GenericDocError =<< sep
-       [ prettyTCM v <+> " does not have the right type for a rewriting relation"
-       , reason
-       ]
   caseMaybeM (relView t)
-    (failure $ "because it should accept at least two arguments") $
+    (typeError $ IncorrectTypeForRewriteRelation v ShouldAcceptAtLeastTwoArguments) $
     \ (RelView tel delta a b core) -> do
-    unless (visible a && visible b) $ failure $ "because its two final arguments are not both visible."
+    unless (visible a && visible b) $ typeError $ IncorrectTypeForRewriteRelation v FinalTwoArgumentsNotVisible
     case unEl core of
       Sort{}   -> return ()
       Con{}    -> __IMPOSSIBLE__
       Level{}  -> __IMPOSSIBLE__
       Lam{}    -> __IMPOSSIBLE__
       Pi{}     -> __IMPOSSIBLE__
-      _ -> failure $ "because its type does not end in a sort, but in "
-             <+> do inTopContext $ addContext tel $ prettyTCM core
+      _ -> typeError $ IncorrectTypeForRewriteRelation v (TypeDoesNotEndInSort core tel)
 
 -- | Deconstructing a type into @Δ → t → t' → core@.
 data RelView = RelView
@@ -139,7 +137,7 @@ addRewriteRules :: [QName] -> TCM ()
 addRewriteRules qs = do
 
   -- Check the rewrite rules
-  rews <- mapM checkRewriteRule qs
+  rews <- mapMaybeM checkRewriteRule qs
 
   -- Add rewrite rules to the signature
   forM_ rews $ \rew -> do
@@ -155,8 +153,7 @@ addRewriteRules qs = do
   -- (should be done after adding all rules, see #3795)
   whenJustM (optConfluenceCheck <$> pragmaOptions) $ \confChk -> do
     -- Warn if --cubical is enabled
-    whenJustM (optCubical <$> pragmaOptions) $ \_ -> genericWarning
-      "Confluence checking for --cubical is not yet supported, confluence checking might be incomplete"
+    whenJustM cubicalOption $ \_ -> warning ConfluenceForCubicalNotSupported
     -- Global confluence checker requires rules to be sorted
     -- according to the generality of their lhs
     when (confChk == GlobalConfluenceCheck) $
@@ -186,12 +183,10 @@ rewriteRelationDom rel = do
 --   Remember that @rel : Δ → A → A → Set i@, so
 --   @rel us : (lhs rhs : A[us/Δ]) → Set i@.
 --   Returns the checked rewrite rule to be added to the signature.
-checkRewriteRule :: QName -> TCM RewriteRule
-checkRewriteRule q = do
-  requireOptionRewriting
-  let failNoBuiltin = typeError $ GenericError $
-        "Cannot add rewrite rule without prior BUILTIN REWRITE"
-  rels <- fromMaybeM failNoBuiltin getBuiltinRewriteRelations
+checkRewriteRule :: QName -> TCM (Maybe RewriteRule)
+checkRewriteRule q = runMaybeT $ setCurrentRange q do
+  lift requireOptionRewriting
+  rels <- lift getBuiltinRewriteRelations
   reportSDoc "rewriting.relations" 40 $ vcat
     [ "Rewrite relations:"
     , prettyList $ map prettyTCM $ toList rels
@@ -200,11 +195,16 @@ checkRewriteRule q = do
   -- Issue 1651: Check that we are not adding a rewrite rule
   -- for a type signature whose body has not been type-checked yet.
   when (isEmptyFunction $ theDef def) $
-    typeError . GenericDocError =<< hsep
-      [ "Rewrite rule from function "
-      , prettyTCM q
-      , " cannot be added before the function definition"
-      ]
+    illegalRule BeforeFunctionDefinition
+  -- Issue 6643: Also check that there are no mututal definitions
+  -- that are not yet defined.
+  whenJustM (asksTC envMutualBlock) \ mb -> do
+    qs <- mutualNames <$> lookupMutualBlock mb
+    when (Set.member q qs) $ forM_ qs $ \r -> do
+      whenM (isEmptyFunction . theDef <$> getConstInfo r) $
+        illegalRule $ BeforeMutualFunctionDefinition r
+
+
   -- Get rewrite rule (type of q).
   TelV gamma1 core <- telView $ defType def
   reportSDoc "rewriting" 30 $ vcat
@@ -212,41 +212,21 @@ checkRewriteRule q = do
     , prettyTCM gamma1
     , " |- " <+> do addContext gamma1 $ prettyTCM core
     ]
-  let failureWrongTarget :: TCM a
-      failureWrongTarget = typeError . GenericDocError =<< hsep
-        [ prettyTCM q , " does not target rewrite relation" ]
-  let failureBlocked :: Blocker -> TCM a
+  let failureBlocked :: Blocker -> MaybeT TCM a
       failureBlocked b
-        | not (null ms) = err $ "it contains the unsolved meta variable(s)" <+> prettyList_ (map prettyTCM $ Set.toList ms)
-        | not (null ps) = err $ "it is blocked on problem(s)" <+> prettyList_ (map prettyTCM $ Set.toList ps)
-        | not (null qs) = err $ "it requires the definition(s) of" <+> prettyList_ (map prettyTCM $ Set.toList qs)
+        | Set1.IsNonEmpty ms <- allBlockingMetas    b = illegalRule $ ContainsUnsolvedMetaVariables ms
+        | Set1.IsNonEmpty ps <- allBlockingProblems b = illegalRule $ BlockedOnProblems ps
+        | Set1.IsNonEmpty qs <- allBlockingDefs     b = illegalRule $ RequiresDefinitions qs
         | otherwise = __IMPOSSIBLE__
-        where
-          err reason = typeError . GenericDocError =<< hsep
-            [ prettyTCM q , " is not a legal rewrite rule, since" , reason ]
-          ms = allBlockingMetas b
-          ps = allBlockingProblems b
-          qs = allBlockingDefs b
-  let failureNotDefOrCon :: TCM a
-      failureNotDefOrCon = typeError . GenericDocError =<< hsep
-        [ prettyTCM q , " is not a legal rewrite rule, since the left-hand side is neither a defined symbol nor a constructor" ]
-  let failureFreeVars :: IntSet -> TCM a
-      failureFreeVars xs = typeError . GenericDocError =<< hsep
-        [ prettyTCM q , " is not a legal rewrite rule, since the following variables are not bound by the left hand side: " , prettyList_ (map (prettyTCM . var) $ IntSet.toList xs) ]
-  let failureNonLinearPars :: IntSet -> TCM a
-      failureNonLinearPars xs = typeError . GenericDocError =<< do
-        (prettyTCM q
-          <+> " is not a legal rewrite rule, since the following parameters are bound more than once on the left hand side: "
-          <+> hsep (List.intersperse "," $ map (prettyTCM . var) $ IntSet.toList xs))
-          <> ". Perhaps you can use a postulate instead of a constructor as the head symbol?"
-  let failureIllegalRule :: TCM a -- TODO:: Defined but not used
-      failureIllegalRule = typeError . GenericDocError =<< hsep
-        [ prettyTCM q , " is not a legal rewrite rule" ]
+  let failureFreeVars :: IntSet -> MaybeT TCM a
+      failureFreeVars xs = illegalRule $ VariablesNotBoundByLHS xs
+  let failureNonLinearPars :: IntSet -> MaybeT TCM a
+      failureNonLinearPars xs = illegalRule $ VariablesBoundMoreThanOnce xs
 
   -- Check that type of q targets rel.
   case unEl core of
     Def rel es@(_:_:_) | rel `elem` rels -> do
-      (delta, a) <- rewriteRelationDom rel
+      (delta, a) <- lift $ rewriteRelationDom rel
       -- Because of the type of rel (Γ → sort), all es are applications.
       let vs = map unArg $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
       -- The last two arguments are lhs and rhs.
@@ -277,7 +257,10 @@ checkRewriteRule q = do
           ~(Just ((_ , _ , pars) , t)) <- getFullyAppliedConType c $ unDom b
           pars <- addContext gamma1 $ checkParametersAreGeneral c pars
           return (conName c , hd , t , pars , vs)
-        _        -> failureNotDefOrCon
+        _ -> do
+          reportSDoc "rewriting.rule.check" 30 $ hsep
+            [ "LHSNotDefinitionOrConstructor: ", prettyTCM lhs ]
+          illegalRule LHSNotDefinitionOrConstructor
 
       ifNotAlreadyAdded f $ do
 
@@ -285,8 +268,9 @@ checkRewriteRule q = do
 
         checkNoLhsReduction f hd es
 
-        ps <- catchPatternErr failureBlocked $
-          patternFrom Relevant 0 (t , Def f) es
+        ps <- fromRightM failureBlocked $ lift $
+          catchPatternErr (pure . Left) $
+            Right <$> patternFrom relevant 0 (t , Def f) es
 
         reportSDoc "rewriting" 30 $
           "Pattern generated from lhs: " <+> prettyTCM (PDef f ps)
@@ -331,68 +315,74 @@ checkRewriteRule q = do
 
         return rew
 
-    _ -> failureWrongTarget
+    _ -> illegalRule DoesNotTargetRewriteRelation
 
   where
-    checkNoLhsReduction :: QName -> (Elims -> Term)  -> Elims -> TCM ()
+    illegalRule :: IllegalRewriteRuleReason -> MaybeT TCM a
+    illegalRule reason = do
+      lift $ warning $ IllegalRewriteRule q reason
+      mzero
+
+    checkNoLhsReduction :: QName -> (Elims -> Term) -> Elims -> MaybeT TCM ()
     checkNoLhsReduction f hd es = do
       -- Skip this check when global confluence check is enabled, as
       -- redundant rewrite rules may be required to prove confluence.
       unlessM ((== Just GlobalConfluenceCheck) . optConfluenceCheck <$> pragmaOptions) $ do
       let v = hd es
       v' <- reduce v
-      let fail :: TCM a
+      let fail :: MaybeT TCM a
           fail = do
             reportSDoc "rewriting" 20 $ "v  = " <+> text (show v)
             reportSDoc "rewriting" 20 $ "v' = " <+> text (show v')
-            typeError . GenericDocError =<< fsep
-              [ prettyTCM q <+> " is not a legal rewrite rule, since the left-hand side "
-              , prettyTCM v <+> " reduces to " <+> prettyTCM v' ]
+            illegalRule $ LHSReduces v v'
       es' <- case v' of
         Def f' es'   | f == f'         -> return es'
         Con c' _ es' | f == conName c' -> return es'
         _                              -> fail
       unless (null es && null es') $ do
-        a   <- computeElimHeadType f es es'
+        a   <- lift $ computeElimHeadType f es es'
         pol <- getPolarity' CmpEq f
-        ok  <- dontAssignMetas $ tryConversion $
+        ok  <- lift $ dontAssignMetas $ tryConversion $
                  compareElims pol [] a (Def f []) es es'
         unless ok fail
 
-    checkAxFunOrCon :: QName -> Definition -> TCM ()
+    checkAxFunOrCon :: QName -> Definition -> MaybeT TCM ()
     checkAxFunOrCon f def = case theDef def of
       Axiom{}        -> return ()
-      def@Function{} -> whenJust (maybeRight (funProjection def)) $ \proj ->
-        case projProper proj of
-          Just{} -> typeError . GenericDocError =<< hsep
-            [ prettyTCM q , " is not a legal rewrite rule, since the head symbol"
-            , prettyTCM f , "is a projection"
-            ]
-          Nothing -> typeError . GenericDocError =<< hsep
-            [ prettyTCM q , " is not a legal rewrite rule, since the head symbol"
-            , hd , "is a projection-like function."
-            , "You can turn off the projection-like optimization for", hd
-            , "with the pragma {-# NOT_PROJECTION_LIKE", hd, "#-}"
-            , "or globally with the flag --no-projection-like"
-            ]
-            where hd = prettyTCM f
+      def@Function{} -> do
+        whenJust (maybeRight (funProjection def)) $ \proj -> case projProper proj of
+          Nothing -> illegalRule $ HeadSymbolIsProjectionLikeFunction f
+          Just{} -> __IMPOSSIBLE__
+            -- Andreas, 2024-08-20
+            -- A projection ought to be impossible in the head, since they are represented
+            -- in post-fix in the internal syntax.
+            -- Thus, a lone projection @p@ will be @λ x → x .p@
+            -- and an applied projection @p t@ will be @t .p@.
+        whenM (isJust . optConfluenceCheck <$> pragmaOptions) $ do
+          let simpleClause cl = (patternsToElims (namedClausePats cl) , clauseBody cl)
+          cls <- instantiateFull $ map simpleClause $ funClauses def
+          unless (noMetas cls) $ illegalRule $ HeadSymbolContainsMetas f
+
       Constructor{}  -> return ()
       AbstractDefn{} -> return ()
       Primitive{}    -> return () -- TODO: is this fine?
-      _              -> typeError . GenericDocError =<< hsep
-        [ prettyTCM q , " is not a legal rewrite rule, since the head symbol"
-        , prettyTCM f , "is not a postulate, a function, or a constructor"
-        ]
+      Datatype{}     -> illegalHead
+      Record{}       -> illegalHead
+      DatatypeDefn{} -> illegalHead
+      RecordDefn{}   -> illegalHead
+      DataOrRecSig{} -> illegalHead
+      PrimitiveSort{}-> illegalHead
+      GeneralizableVar{} -> __IMPOSSIBLE__
 
-    ifNotAlreadyAdded :: QName -> TCM RewriteRule -> TCM RewriteRule
+      where
+      illegalHead = illegalRule $ HeadSymbolIsTypeConstructor f
+
+    ifNotAlreadyAdded :: QName -> MaybeT TCM RewriteRule -> MaybeT TCM RewriteRule
     ifNotAlreadyAdded f cont = do
       rews <- getRewriteRulesFor f
       -- check if q is already an added rewrite rule
       case List.find ((q ==) . rewName) rews of
-        Just rew -> do
-          genericWarning =<< do
-            "Rewrite rule " <+> prettyTCM q <+> " has already been added"
-          return rew
+        Just rew -> illegalRule DuplicateRewriteRule
         Nothing -> cont
 
     usedArgs :: Definition -> IntSet
@@ -404,7 +394,7 @@ checkRewriteRule q = do
         used Pos.Unused = False
         used _          = True
 
-    checkParametersAreGeneral :: ConHead -> Args -> TCM [Int]
+    checkParametersAreGeneral :: ConHead -> Args -> MaybeT TCM [Int]
     checkParametersAreGeneral c vs = do
         is <- loop vs
         unless (fastDistinct is) $ errorNotGeneral
@@ -415,12 +405,8 @@ checkRewriteRule q = do
           Var i [] -> (i :) <$> loop vs
           _        -> errorNotGeneral
 
-        errorNotGeneral :: TCM a
-        errorNotGeneral = typeError . GenericDocError =<< vcat
-            [ prettyTCM q <+> text " is not a legal rewrite rule, since the constructor parameters are not fully general:"
-            , nest 2 $ text "Constructor: " <+> prettyTCM c
-            , nest 2 $ text "Parameters: " <+> prettyList (map prettyTCM vs)
-            ]
+        errorNotGeneral :: MaybeT TCM a
+        errorNotGeneral = illegalRule $ ConstructorParametersNotGeneral c vs
 
 -- | @rewriteWith t f es rew@ where @f : t@
 --   tries to rewrite @f es@ with @rew@, returning the reduct if successful.

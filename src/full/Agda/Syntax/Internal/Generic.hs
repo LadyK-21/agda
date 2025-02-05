@@ -1,15 +1,12 @@
-{-# LANGUAGE CPP          #-}
 
 -- | Tree traversal for internal syntax.
 
 module Agda.Syntax.Internal.Generic where
 
-#if __GLASGOW_HASKELL__ < 804
-import Data.Monoid ((<>))
-#endif
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.Utils.Functor
+import Agda.Utils.List1 (List1)
 
 -- | Generic term traversal.
 --
@@ -61,6 +58,7 @@ instance TermLike a => TermLike (Elim' a)      where
 instance TermLike a => TermLike (Arg a)        where
 instance TermLike a => TermLike (Dom a)        where
 instance TermLike a => TermLike [a]            where
+instance TermLike a => TermLike (List1 a)      where
 instance TermLike a => TermLike (Maybe a)      where
 instance TermLike a => TermLike (Blocked a)    where
 instance TermLike a => TermLike (Abs a)        where

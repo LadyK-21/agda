@@ -6,6 +6,7 @@ module Agda.TypeChecking.Serialise.Instances.Highlighting where
 
 import qualified Data.Map.Strict as Map
 import Data.Strict.Tuple (Pair(..))
+import Data.Word (Word32)
 
 import qualified Agda.Interaction.Highlighting.Range   as HR
 import qualified Agda.Interaction.Highlighting.Precise as HP
@@ -91,6 +92,8 @@ instance EmbPrj HP.OtherAspect where
   icod_ HP.ConfluenceProblem    = pure 12
   icod_ HP.MissingDefinition    = pure 13
   icod_ HP.ShadowingInTelescope = pure 14
+  icod_ HP.CosmeticProblem      = pure 15
+  icod_ HP.InstanceProblem      = pure 16
 
   value = \case
     0  -> pure HP.Error
@@ -108,6 +111,8 @@ instance EmbPrj HP.OtherAspect where
     12 -> pure HP.ConfluenceProblem
     13 -> pure HP.MissingDefinition
     14 -> pure HP.ShadowingInTelescope
+    15 -> pure HP.CosmeticProblem
+    16 -> pure HP.InstanceProblem
     _  -> malformed
 
 instance EmbPrj HP.Aspects where
@@ -124,20 +129,22 @@ instance EmbPrj a => EmbPrj (RM.RangeMap a) where
   -- Write the RangeMap as flat list rather than a list of (Int, (Int, x)). Much
   -- like Map, we need to call `convert' in the tail position and so the output
   -- list is written (and read) in reverse order.
-  icod_ (RM.RangeMap f) = icodeNode =<< convert [] (Map.toAscList f) where
-    convert ys [] = return ys
-    convert ys ((start, RM.PairInt (end :!: entry)):xs) = do
-      start <- icode start
-      end <- icode end
-      entry <- icode entry
-      convert (start:end:entry:ys) xs
+  icod_ (RM.RangeMap f) = icodeNode =<< convert Empty (Map.toAscList f) where
+    convert :: Node -> [(Int, RM.PairInt a)] -> S Node
+    convert !ys [] = return ys
+    convert  ys ((start, RM.PairInt (end :!: entry)):xs) = do
+      !start <- icode start
+      !end <- icode end
+      !entry <- icode entry
+      convert (Cons start (Cons end (Cons entry ys))) xs
 
   value = vcase (fmap (RM.RangeMap . Map.fromDistinctAscList) . convert []) where
-    convert ys [] = return ys
-    convert ys (start:end:entry:xs) = do
-      start <- value start
-      end <- value end
-      entry <- value entry
+    convert :: [(Int, RM.PairInt a)] -> [Word32] -> R [(Int, RM.PairInt a)]
+    convert !ys [] = return ys
+    convert  ys (start:end:entry:xs) = do
+      !start <- value start
+      !end <- value end
+      !entry <- value entry
       convert ((start, RM.PairInt (end :!: entry)):ys) xs
     convert _ _ = malformed
 

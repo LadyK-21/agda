@@ -6,6 +6,7 @@ module Agda.TypeChecking.SizedTypes where
 
 import Prelude hiding (null)
 
+import Control.Monad.Trans.Maybe ( MaybeT(..), runMaybeT )
 import Control.Monad.Except ( MonadError(..) )
 import Control.Monad.Writer ( MonadWriter(..), WriterT(..), runWriterT )
 
@@ -77,8 +78,7 @@ checkSizeLtSat t = whenM haveSizeLt $ do
             reportSLn "tc.size.lt" 20 $ " - size bound is not blocked"
             catchConstraint (CheckSizeLtSat t) $ do
               unlessM (checkSizeNeverZero b) $ do
-                typeError . GenericDocError =<< do
-                  "Possibly empty type of sizes " <+> prettyTCM t
+                typeError $ EmptyTypeOfSizes t
 
 -- | Precondition: Term is reduced and not blocked.
 --   Throws a 'patternViolation' if undecided
@@ -137,7 +137,7 @@ checkSizeVarNeverZero i = do
   -- Looking for the minimal value for size variable i,
   -- we can restrict to the last i
   -- entries, as only these can contain i in an upper bound.
-  ts <- map (snd . unDom) . take i <$> getContext
+  ts <- map ctxEntryType . take i <$> getContext
   -- If we encountered a blocking meta in the context, we cannot
   -- say ``no'' for sure.
   (n, blockers) <- runWriterT $ minSizeValAux ts $ repeat 0
@@ -174,7 +174,7 @@ checkSizeVarNeverZero i = do
               -- Thus, we update the min value for @j@ with function @(max (n+1-m))@.
               DSizeVar (ProjectedVar j []) m -> do
                 reportSLn "tc.size" 60 $ "minSizeVal upper bound v = " ++ show v
-                let ns' = List.updateAt j (max $ n+1-m) ns
+                let ns' = List.updateAt j (max $ n + 1 - m) ns
                 reportSLn "tc.size" 60 $ "minSizeVal ns' = " ++ show (take (length ts + 1) ns')
                 minSizeValAux ts ns'
               DSizeMeta x _ _ -> perhaps (unblockOnMeta x)
@@ -242,10 +242,10 @@ trySizeUniv cmp t m n x els1 y els2 = do
       failure = typeError $ UnequalTerms cmp m n t
       forceInfty u = compareSizes CmpEq (unArg u) =<< primSizeInf
   -- Get the SIZE built-ins.
-  (size, sizelt) <- flip catchError (const failure) $ do
-     Def size   _ <- primSize
-     Def sizelt _ <- primSizeLt
-     return (size, sizelt)
+  (size, sizelt) <- maybe failure pure =<< runMaybeT do
+    size   <- MaybeT $ getBuiltinName' builtinSize
+    sizelt <- MaybeT $ getBuiltinName' builtinSizeLt
+    pure (size, sizelt)
   case (cmp, els1, els2) of
      -- Case @Size< _ <= Size@: true.
      (CmpLeq, [_], [])  | x == sizelt && y == size -> return ()
@@ -264,8 +264,8 @@ trySizeUniv cmp t m n x els1 y els2 = do
 --   Precondition: sized types are enabled.
 deepSizeView :: (PureTCM m, MonadTCError m) => Term -> m DeepSizeView
 deepSizeView v = do
-  Def inf [] <- primSizeInf
-  Def suc [] <- primSizeSuc
+  inf <- getBuiltinName_ builtinSizeInf
+  suc <- getBuiltinName_ builtinSizeSuc
   let loop v =
         reduce v >>= \case
           Def x []        | x == inf -> return $ DSizeInf
@@ -279,9 +279,9 @@ deepSizeView v = do
 
 sizeMaxView :: PureTCM m => Term -> m SizeMaxView
 sizeMaxView v = do
-  inf <- getBuiltinDefName builtinSizeInf
-  suc <- getBuiltinDefName builtinSizeSuc
-  max <- getBuiltinDefName builtinSizeMax
+  inf <- getBuiltinName' builtinSizeInf
+  suc <- getBuiltinName' builtinSizeSuc
+  max <- getBuiltinName' builtinSizeMax
   let loop v = do
         v <- reduce v
         case v of
@@ -298,6 +298,7 @@ sizeMaxView v = do
 -- * Size comparison that might add constraints.
 ------------------------------------------------------------------------
 
+{-# SPECIALIZE compareSizes :: Comparison -> Term -> Term -> TCM () #-}
 -- | Compare two sizes.
 compareSizes :: (MonadConversion m) => Comparison -> Term -> Term -> m ()
 compareSizes cmp u v = verboseBracket "tc.conv.size" 10 "compareSizes" $ do
@@ -323,10 +324,10 @@ compareSizes cmp u v = verboseBracket "tc.conv.size" 10 "compareSizes" $ do
 compareMaxViews :: (MonadConversion m) => Comparison -> SizeMaxView -> SizeMaxView -> m ()
 compareMaxViews cmp us vs = case (cmp, us, vs) of
   (CmpLeq, _, (DSizeInf :| _)) -> return ()
-  (cmp, u:|[], v:|[]) -> compareSizeViews cmp u v
-  (CmpLeq, us, v:|[]) -> Fold.forM_ us $ \ u -> compareSizeViews cmp u v
-  (CmpLeq, us, vs)    -> Fold.forM_ us $ \ u -> compareBelowMax u vs
-  (CmpEq,  us, vs)    -> do
+  (cmp,    u :| [], v :| []) -> compareSizeViews cmp u v
+  (CmpLeq, us,      v :| []) -> Fold.forM_ us $ \ u -> compareSizeViews cmp u v
+  (CmpLeq, us,      vs)      -> Fold.forM_ us $ \ u -> compareBelowMax u vs
+  (CmpEq,  us,      vs)      -> do
     compareMaxViews CmpLeq us vs
     compareMaxViews CmpLeq vs us
 
@@ -581,7 +582,7 @@ oldSizeExpr u = do
   s <- sizeView u
   case s of
     SizeInf     -> patternViolation neverUnblock
-    SizeSuc u   -> mapSnd (+1) <$> oldSizeExpr u
+    SizeSuc u   -> mapSnd (+ 1) <$> oldSizeExpr u
     OtherSize u -> case u of
       Var i []  -> return (Rigid i, 0)
       MetaV m es | Just xs <- mapM isVar es, fastDistinct xs

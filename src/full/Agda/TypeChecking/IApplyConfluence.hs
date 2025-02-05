@@ -4,8 +4,7 @@ module Agda.TypeChecking.IApplyConfluence where
 
 import Prelude hiding (null, (!!))  -- do not use partial functions like !!
 
-import Control.Monad
-import Control.Monad.Except
+import Control.Monad.Except ( MonadError(..) )
 
 import Data.Bifunctor (first, second)
 import Data.DList (DList)
@@ -42,7 +41,7 @@ import Agda.Utils.Functor
 
 
 checkIApplyConfluence_ :: QName -> TCM ()
-checkIApplyConfluence_ f = whenM (isJust . optCubical <$> pragmaOptions) $ do
+checkIApplyConfluence_ f = whenM (isJust <$> cubicalOption) $ do
   -- Andreas, 2019-03-27, iapply confluence should only be checked
   -- when --cubical or --erased-cubical is active. See
   -- test/Succeed/CheckIApplyConfluence.agda.
@@ -200,10 +199,10 @@ unifyElims vs ts k = do
                          else Just c) .
     zipWith (\i c -> (i, dropS (i + 1) s `applySubst` c)) [0..]
 
--- | Like @unifyElims@ but @Γ@ is from the the meta's @MetaInfo@ and
+-- | Like @unifyElims@ but @Γ@ is from the meta's @MetaInfo@ and
 -- the context extension @Δ@ is taken from the @Closure@.
 unifyElimsMeta :: MetaId -> Args -> Closure Constraint -> ([(Term,Term)] -> Constraint -> TCM a) -> TCM a
-unifyElimsMeta m es_m cl k = ifM (isNothing . optCubical <$> pragmaOptions) (enterClosure cl $ k []) $ do
+unifyElimsMeta m es_m cl k = ifM (isNothing <$> cubicalOption) (enterClosure cl $ k []) $ do
                   mv <- lookupLocalMeta m
                   enterClosure (getMetaInfo mv) $ \ _ -> do -- mTel ⊢
                   ty <- metaType m

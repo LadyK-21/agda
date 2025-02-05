@@ -15,12 +15,17 @@ import Control.Monad.Reader   ( ReaderT )
 import Control.Monad.State    ( StateT  )
 import Control.Monad.Writer   ( WriterT )
 import Control.Monad.Trans    ( lift    )
+import Control.Monad.Trans.Maybe
 
 import Data.Maybe             ( isNothing )
 
 import qualified Data.ByteString.Char8 as ByteStringChar8
 import qualified Data.ByteString.Lazy as ByteStringLazy
 
+import Data.EnumMap (EnumMap)
+import qualified Data.EnumMap as EnumMap
+import Data.EnumSet (EnumSet)
+import qualified Data.EnumSet as EnumSet
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
@@ -45,6 +50,7 @@ import Text.PrettyPrint.Annotated (Doc, isEmpty)
 import Agda.Utils.Bag (Bag)
 import qualified Agda.Utils.Bag as Bag
 
+import Agda.Utils.Unsafe (unsafeComparePointers)
 import Agda.Utils.Impossible
 
 class Null a where
@@ -52,8 +58,10 @@ class Null a where
   null  :: a -> Bool
   -- ^ Satisfying @null empty == True@.
 
+  -- | The default implementation of 'null' compares with 'empty',
+  --   first trying pointer equality, then falling back to 'Eq' equality.
   default null :: Eq a => a -> Bool
-  null = (== empty)
+  null a = unsafeComparePointers a empty || a == empty
 
 instance Null () where
   empty  = ()
@@ -90,6 +98,14 @@ instance Null [a] where
 instance Null (Bag a) where
   empty = Bag.empty
   null  = Bag.null
+
+instance Null (EnumMap k a) where
+  empty = EnumMap.empty
+  null  = EnumMap.null
+
+instance Null (EnumSet a) where
+  empty = EnumSet.empty
+  null  = EnumSet.null
 
 instance Null (IntMap a) where
   empty = IntMap.empty
@@ -145,6 +161,10 @@ instance (Null (m a), Monad m) => Null (ExceptT e m a) where
   empty = lift empty
   null  = __IMPOSSIBLE__
 
+instance (Null (m a), Monad m) => Null (MaybeT m a) where
+  empty = lift empty
+  null  = __IMPOSSIBLE__
+
 instance (Null (m a), Monad m) => Null (ReaderT r m a) where
   empty = lift empty
   null  = __IMPOSSIBLE__
@@ -182,3 +202,10 @@ whenNullM ma k = ma >>= (`whenNull` k)
 
 unlessNullM :: (Monad m, Null a) => m a -> (a -> m ()) -> m ()
 unlessNullM ma k = ma >>= (`unlessNull` k)
+
+applyUnlessNull :: (Null a) => a -> (a -> b -> b) -> (b -> b)
+applyUnlessNull a f = if null a then id else f a
+
+-- | Disjunction (interpreting @null _@ as @False@).
+catchNull :: Null a => a -> a -> a
+catchNull a b = if null a then b else a

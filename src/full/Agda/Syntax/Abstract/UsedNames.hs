@@ -133,10 +133,12 @@ instance BoundAndUsed e => BoundAndUsed (LHSCore' e) where
 instance (BoundAndUsed x, BoundAndUsed p, BoundAndUsed e) => BoundAndUsed (RewriteEqn' q x p e) where
   boundAndUsed (Rewrite es)  = boundAndUsed $ snd <$> es
   boundAndUsed (Invert _ bs) = parBoundAndUsed (namedThing <$> bs) <> boundAndUsed (nameOf <$> bs)
+  boundAndUsed (LeftLet bs)  = boundAndUsed bs
 
 instance BoundAndUsed LetBinding where
   boundAndUsed = \ case   -- Note: binder last since it's not recursive
     LetBind _ _ x ty e     -> boundAndUsed ((ty, e), x)
+    LetAxiom _ _ x ty      -> boundAndUsed (ty, x)
     LetPatBind _ p e       -> boundAndUsed (e, p)
     LetApply _ _ _ app _ _ -> boundAndUsed app
     LetOpen{}              -> mempty
@@ -151,7 +153,7 @@ instance BoundAndUsed TypedBinding where
   boundAndUsed (TLet _ bs)       = boundAndUsed bs
 
 instance BoundAndUsed name => BoundAndUsed (Binder' name) where
-  boundAndUsed (Binder p x) = parBindings p x
+  boundAndUsed (Binder p _ x) = parBindings p x
 
 instance BoundAndUsed BindName where
   boundAndUsed x = singleBind (unBind x)
@@ -171,7 +173,6 @@ instance BoundAndUsed e => BoundAndUsed (Pattern' e) where
     RecP _ as          -> parBoundAndUsed as
     EqualP _ eqs       -> parBoundAndUsed eqs
     WithP _ p          -> boundAndUsed p
-    AnnP _ ty p        -> boundAndUsed (ty, p)
 
 instance BoundAndUsed e => BoundAndUsed (FieldAssignment' e) where
   boundAndUsed (FieldAssignment _ e) = boundAndUsed e
@@ -179,4 +180,3 @@ instance BoundAndUsed e => BoundAndUsed (FieldAssignment' e) where
 instance BoundAndUsed ModuleApplication where
   boundAndUsed (SectionApp tel _ es)  = noBindings $ boundAndUsed (tel, es)
   boundAndUsed RecordModuleInstance{} = mempty
-

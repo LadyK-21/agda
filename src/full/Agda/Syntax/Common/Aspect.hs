@@ -1,6 +1,7 @@
 module Agda.Syntax.Common.Aspect where
 
-import {-# SOURCE #-} Agda.Syntax.TopLevelModuleName
+import Agda.Syntax.TopLevelModuleName.Boot (TopLevelModuleName')
+import Agda.Syntax.Position (Range)
 import Agda.Utils.Maybe
 import GHC.Generics
 
@@ -75,9 +76,15 @@ data OtherAspect
   | TypeChecks
     -- ^ Code which is being type-checked.
   | MissingDefinition
-    -- ^ Function declaration without matching definition
-  -- NB: We put CatchallClause last so that it is overwritten by other,
+    -- ^ Function declaration without matching definition.
+  | InstanceProblem
+      -- ^ Unusable instance etc.
+
+  -- NB: We put CatchallClause and CosmeticProblem last
+  -- so that they are overwritten by other,
   -- more important, aspects in the emacs mode.
+  | CosmeticProblem
+      -- ^ Nothing serious, just a beauty flaw.
   | CatchallClause
   | ConfluenceProblem
     deriving (Eq, Ord, Show, Enum, Bounded, Generic)
@@ -129,7 +136,7 @@ data Aspects = Aspects
   deriving (Show, Generic)
 
 data DefinitionSite = DefinitionSite
-  { defSiteModule :: TopLevelModuleName
+  { defSiteModule :: (TopLevelModuleName' Range)
       -- ^ The defining module.
   , defSitePos    :: Int
       -- ^ The file position in that module. File positions are

@@ -14,7 +14,9 @@ import qualified Data.Set as Set
 
 import Agda.Interaction.AgdaTop
 import Agda.Interaction.Base
-         ( CommandState(..), CurrentFile(..), ComputeMode(..), Rewrite(..), OutputForm(..), OutputConstraint(..) )
+         ( CommandState(..), CurrentFile(..), ComputeMode(..), Rewrite(..)
+         , OutputConstraint_boot(..), OutputForm_boot(..))
+import Agda.Interaction.Output (OutputConstraint, OutputForm)
 import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.EmacsTop
 import Agda.Interaction.JSON
@@ -110,7 +112,7 @@ instance ToJSON (Position' ()) where
 instance EncodeTCM Range where
 instance ToJSON Range where
   toJSON = toJSON . map prettyInterval . rangeIntervals
-    where prettyInterval i = object [ "start" .= iStart i, "end" .= iEnd i ]
+    where prettyInterval (Interval f s e) = object [ "start" .= (f <$ s), "end" .= (f <$ e) ]
 
 instance EncodeTCM ProblemId where
 instance EncodeTCM MetaId    where
@@ -242,6 +244,9 @@ encodeOC f encPrettyTCM = \case
           [ "value"  #= encPrettyTCM v
           , "type"   #= encPrettyTCM t
           ]
+ ResolveInstanceOF q -> kind "ResolveInstanceOF"
+  [ "name"           @= encodePretty q
+  ]
  PTSInstance a b -> kind "PTSInstance"
   [ "constraintObjs" #= traverse f [a, b]
   ]
@@ -459,6 +464,9 @@ instance EncodeTCM Response where
         [ "interactionPoint"  .= i
         , "expression"        .= P.prettyShow expr
         ]
+  encodeTCM (Resp_Mimer ii str) = kind "Mimer"
+    [ "solution" @= str
+    ]
 
 -- | Convert Response to an JSON value for interactive editor frontends.
 jsonifyResponse :: Response -> TCM ByteString

@@ -2,19 +2,12 @@
 
 module Agda.TypeChecking.DeadCode (eliminateDeadCode) where
 
-import qualified Control.Exception as E
+import Control.Monad (filterM)
 import Control.Monad.Trans
 
 import Data.Maybe
-import Data.Monoid (All(..))
 import qualified Data.Map.Strict as MapS
-import Data.Set (Set)
-import qualified Data.Set as Set
 import qualified Data.HashMap.Strict as HMap
-
-import Agda.Interaction.Options
-
-import qualified Agda.Syntax.Abstract as A
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
@@ -25,122 +18,128 @@ import qualified Agda.Benchmarking as Bench
 import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 
 import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Reduce
 
+import Agda.Utils.Monad (mapMaybeM)
 import Agda.Utils.Impossible
 import Agda.Utils.Lens
 
--- | Run before serialisation to remove any definitions and
--- meta-variables that are not reachable from the module's public
--- interface.
---
--- Things that are reachable only from warnings are removed.
+import Agda.Utils.HashTable (HashTable)
+import qualified Agda.Utils.HashTable as HT
 
-eliminateDeadCode ::
-  BuiltinThings PrimFun -> DisplayForms -> Signature ->
-  LocalMetaStore ->
-  TCM (DisplayForms, Signature, RemoteMetaStore)
-eliminateDeadCode bs disp sig ms = Bench.billTo [Bench.DeadCode] $ do
-  patsyn <- getPatternSyns
-  public <- Set.mapMonotonic anameName . publicNames <$> getScope
-  save   <- optSaveMetas <$> pragmaOptions
-  defs   <- (if save then return else traverse instantiateFull)
-                 (sig ^. sigDefinitions)
+-- | Run before serialisation to remove data that's not reachable from the
+--   public interface. We do not compute reachable data precisely, because that
+--   would be very expensive, mainly because of rewrite rules. The following
+--   things are assumed to be "roots":
+--     - public definitions
+--     - definitions marked as primitive
+--     - definitions with COMPILE pragma
+--     - all pattern synonyms (because currently all of them go into interfaces)
+--     - all parameter sections (because currently all of them go into interfaces)
+--       (see also issues #6931 and #7382)
+--     - local builtins
+--     - all rewrite rules
+--     - closed display forms
+--   We only ever prune dead metavariables and definitions. We return the pruned metas,
+--   pruned definitions and closed display forms.
+eliminateDeadCode :: ScopeInfo -> TCM (RemoteMetaStore, Definitions, DisplayForms)
+eliminateDeadCode !scope = Bench.billTo [Bench.DeadCode] $ do
+  !sig <- getSignature
+  let !defs = sig ^. sigDefinitions
+  !metas <- useR stSolvedMetaStore
+
   -- #2921: Eliminating definitions with attached COMPILE pragmas results in
   -- the pragmas not being checked. Simple solution: don't eliminate these.
   -- #6022 (Andreas, 2022-09-30): Eliminating cubical primitives can lead to crashes.
-   -- Simple solution: retain all primitives (shouldn't be many).
+  -- Simple solution: retain all primitives (shouldn't be many).
   let hasCompilePragma = not . MapS.null . defCompiledRep
+
       isPrimitive = \case
         Primitive{}     -> True
         PrimitiveSort{} -> True
-        _ -> False
+        _               -> False
+
       extraRootsFilter (name, def)
         | hasCompilePragma def || isPrimitive (theDef def) = Just name
         | otherwise = Nothing
-      extraRoots =
-        Set.fromList $ mapMaybe extraRootsFilter $ HMap.toList defs
 
-      rootNames = Set.union public extraRoots
-      rootMetas =
-        if not save then Set.empty else metasIn
-          ( bs
-          , sig ^. sigSections
-          , sig ^. sigRewriteRules
-          , HMap.filterWithKey (\x _ -> Set.member x rootNames) disp
-          )
-      (rns, rms) =
-        reachableFrom (rootNames, rootMetas) patsyn disp defs ms
-      dead  = Set.fromList (HMap.keys defs) `Set.difference` rns
-      valid = getAll . namesIn' (All . (`Set.notMember` dead))  -- no used name is dead
-      defs' = HMap.map ( \ d -> d { defDisplay = filter valid (defDisplay d) } )
-            $ HMap.filterWithKey (\ x _ -> Set.member x rns) defs
-      disp' = HMap.filter (not . null) $ HMap.map (filter valid) disp
-      ms'   = HMap.fromList $
-              mapMaybe
-                (\(m, mv) ->
-                  if not (Set.member m rms)
-                  then Nothing
-                  else Just (m, remoteMetaVariable mv)) $
-              MapS.toList ms
-  -- The hashmaps are forced to WHNF to ensure that the computations
-  -- are billed to the right account.
-  disp' <- liftIO $ E.evaluate disp'
-  defs' <- liftIO $ E.evaluate defs'
-  ms'   <- liftIO $ E.evaluate ms'
-  reportSLn "tc.dead" 10 $
-    "Removed " ++ show (HMap.size defs - HMap.size defs') ++
-    " unused definitions and " ++ show (MapS.size ms - HMap.size ms') ++
-    " unused meta-variables."
-  return (disp', set sigDefinitions defs' sig, ms')
+  let !pubModules = publicModules scope
 
-reachableFrom
-  :: (Set QName, Set MetaId)  -- ^ Roots.
-  -> A.PatternSynDefns -> DisplayForms -> Definitions -> LocalMetaStore
-  -> (Set QName, Set MetaId)
-reachableFrom (ids, ms) psyns disp defs insts =
-  follow (ids, ms)
-    (map Left (Set.toList ids) ++ map Right (Set.toList ms))
-  where
-  follow seen        []       = seen
-  follow (!ids, !ms) (x : xs) =
-    follow (Set.union ids'' ids, Set.union ms'' ms)
-      (map Left  (Set.toList ids'') ++
-       map Right (Set.toList ms'')  ++
-       xs)
-    where
-    ids'' = ids' `Set.difference` ids
-    ms''  = ms'  `Set.difference` ms
+    -- Ulf, 2016-04-12:
+    -- Non-closed display forms are not applicable outside the module anyway,
+    -- and should be dead-code eliminated (#1928).
+  !rootDisplayForms <-
+      HMap.filter (not . null) . HMap.map (filter isClosed) <$> useTC stImportsDisplayForms
 
-    (ids', ms') = case x of
-      Left x ->
-        namesAndMetasIn
-          ( HMap.lookup x defs
-          , PSyn <$> MapS.lookup x psyns
-          , HMap.lookup x disp
-          )
-      Right m -> case MapS.lookup m insts of
-        Nothing -> (Set.empty, Set.empty)
-        Just mv -> namesAndMetasIn (instBody (theInstantiation mv))
+  let !rootPubNames  = map anameName $ publicNamesOfModules pubModules
+  let !rootExtraDefs = mapMaybe extraRootsFilter $ HMap.toList defs
+  let !rootRewrites  = sig ^. sigRewriteRules
+  let !rootModSections = sig ^. sigSections
+  !rootBuiltins <- useTC stLocalBuiltins
+  !rootPatSyns  <- getPatternSyns
+
+  !seenNames <- liftIO HT.empty :: TCM (HashTable QName ())
+  !seenMetas <- liftIO HT.empty :: TCM (HashTable MetaId ())
+
+  let goName :: QName -> IO ()
+      goName !x = HT.lookup seenNames x >>= \case
+        Just _ ->
+          pure ()
+        Nothing -> do
+          HT.insert seenNames x ()
+          go (HMap.lookup x defs)
+
+      goMeta :: MetaId -> IO ()
+      goMeta !m = HT.lookup seenMetas m >>= \case
+        Just _ ->
+          pure ()
+        Nothing -> do
+          HT.insert seenMetas m ()
+          case MapS.lookup m metas of
+            Nothing -> pure ()
+            Just mv -> do
+              go (instBody (theInstantiation mv))
+              go (jMetaType (mvJudgement mv))
+
+      go :: NamesIn a => a -> IO ()
+      go !x = namesAndMetasIn' (either goName goMeta) x
+      {-# INLINE go #-}
+
+  Bench.billTo [Bench.DeadCode, Bench.DeadCodeReachable] $ liftIO $ do
+    go rootDisplayForms
+    foldMap goName rootPubNames
+    foldMap goName rootExtraDefs
+    go rootRewrites
+    go rootModSections
+    go rootBuiltins
+    foldMap (go . PSyn) rootPatSyns
+
+  let filterMeta :: (MetaId, MetaVariable) -> IO (Maybe (MetaId, RemoteMetaVariable))
+      filterMeta (!i, !m) = HT.lookup seenMetas i >>= \case
+        Nothing -> pure Nothing
+        Just _  -> let !m' = remoteMetaVariable m in pure $ Just (i, m')
+
+      filterDef :: (QName, Definition) -> IO Bool
+      filterDef (!x, !d) = HT.lookup seenNames x >>= \case
+        Nothing -> pure False
+        Just _  -> pure True
+
+  !metas <- liftIO $ HMap.fromList <$> mapMaybeM filterMeta (MapS.toList metas)
+  !defs  <- liftIO $ HMap.fromList <$> filterM filterDef (HMap.toList defs)
+  pure (metas, defs, rootDisplayForms)
 
 -- | Returns the instantiation.
---
--- Precondition: The instantiation must be of the form @'InstV' inst@.
-
+--   Precondition: The instantiation must be of the form @'InstV' inst@.
 theInstantiation :: MetaVariable -> Instantiation
 theInstantiation mv = case mvInstantiation mv of
   InstV inst                     -> inst
-  Open{}                         -> __IMPOSSIBLE__
-  OpenInstance{}                 -> __IMPOSSIBLE__
+  OpenMeta{}                     -> __IMPOSSIBLE__
   BlockedConst{}                 -> __IMPOSSIBLE__
   PostponedTypeCheckingProblem{} -> __IMPOSSIBLE__
 
 -- | Converts from 'MetaVariable' to 'RemoteMetaVariable'.
---
--- Precondition: The instantiation must be of the form @'InstV' inst@.
-
+--   Precondition: The instantiation must be of the form @'InstV' inst@.
 remoteMetaVariable :: MetaVariable -> RemoteMetaVariable
-remoteMetaVariable mv = RemoteMetaVariable
+remoteMetaVariable !mv = RemoteMetaVariable
   { rmvInstantiation = theInstantiation mv
   , rmvModality      = getModality mv
   , rmvJudgement     = mvJudgement mv

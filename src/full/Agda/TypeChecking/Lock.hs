@@ -9,8 +9,6 @@ module Agda.TypeChecking.Lock
   )
 where
 
-import Control.Monad            ( filterM, forM, forM_ )
-
 import qualified Data.IntMap as IMap
 import qualified Data.IntSet as ISet
 import qualified Data.Set as Set
@@ -45,7 +43,10 @@ checkLockedVars
 checkLockedVars t ty lk lk_ty = catchConstraint (CheckLockedVars t ty lk lk_ty) $ do
   -- Have to instantiate the lock, otherwise we might block on it even
   -- after it's been solved (e.g.: it's an interaction point, see #6528)
-  lk <- instantiate lk
+  -- Update (Andreas, 2023-10-23, issue #6913): need even full instantiation.
+  -- Since @lk@ is typically just a variable, 'instantiateFull' is not expensive here.
+  -- In #6913 it was a postulate applied to a meta, thus, 'instantiate' was not enough.
+  lk <- instantiateFull lk
   reportSDoc "tc.term.lock" 40 $ "Checking locked vars.."
   reportSDoc "tc.term.lock" 50 $ nest 2 $ vcat
      [ text "t     = " <+> pretty t
@@ -66,11 +67,11 @@ checkLockedVars t ty lk lk_ty = catchConstraint (CheckLockedVars t ty lk lk_ty) 
     rigid = rigidVars fv
     -- flexible = IMap.keysSet $ flexibleVars fv
     termVars = allVars fv -- ISet.union rigid flexible
-    earlierVars = ISet.fromList [i+1 .. size cxt - 1]
+    earlierVars = ISet.fromList [i + 1 .. size cxt - 1]
   if termVars `ISet.isSubsetOf` earlierVars then return () else do
 
-  checked <- fmap catMaybes . forM toCheck $ \ (j,dom) -> do
-    ifM (isTimeless (snd . unDom $ dom))
+  checked <- fmap catMaybes . forM toCheck $ \ (j,ce) -> do
+    ifM (isTimeless (ctxEntryType ce))
         (return $ Just j)
         (return $ Nothing)
 
@@ -91,19 +92,23 @@ checkLockedVars t ty lk lk_ty = catchConstraint (CheckLockedVars t ty lk lk_ty) 
     -- List1.fromList is guarded by not (null illegalVars)
 
 
+-- | Precondition: 'Term' is fully instantiated.
 getLockVar :: Term -> TCMT IO (Maybe Int)
 getLockVar lk = do
   let
     fv = freeVarsIgnore IgnoreInAnnotations lk
     flex = flexibleVars fv
 
-    isLock i = fmap (getLock . domInfo) (lookupBV i) <&> \case
+    isLock i = fmap (getLock . domInfo) (domOfBV i) <&> \case
       IsLock{} -> True
       IsNotLock{} -> False
 
   unless (IMap.null flex) $ do
     let metas = Set.unions $ map (foldrMetaSet Set.insert Set.empty) $ IMap.elems flex
     patternViolation $ unblockOnAnyMeta metas
+      -- Andreas, 2023-10-23, issue #6913:
+      -- We should not block on solved metas, so we need @lk@ to be fully instantiated,
+      -- otherwise it may mention solved metas which end up here.
 
   is <- filterM isLock $ ISet.toList $ rigidVars fv
 
@@ -123,18 +128,11 @@ isTimeless t = do
     Def q _ | Just q `elem` timeless -> return True
     _                                -> return False
 
-notAllowedVarsError :: Term -> [Int] -> TCM b
-notAllowedVarsError lk is = do
-        typeError . GenericDocError =<<
-         ("The following vars are not allowed in a later value applied to"
-          <+> prettyTCM lk <+> ":" <+> prettyTCM (map var $ is))
-
-checkEarlierThan :: Term -> VSet.VarSet -> TCM ()
+-- | If the first argument is a lock variable, check that all variables in the given set
+--   are either earlier than this variable or are timeless.
+--
+checkEarlierThan :: Term -> VSet.VarSet -> TCM Bool
 checkEarlierThan lk fvs = do
-  mv <- getLockVar lk
-  caseMaybe mv (return ()) $ \ i -> do
-    let problems = filter (<= i) $ VSet.toList fvs
-    forM_ problems $ \ j -> do
-      ty <- typeOfBV j
-      unlessM (isTimeless ty) $
-        notAllowedVarsError lk [j]
+  getLockVar lk >>= \case
+    Nothing -> return True
+    Just i  -> flip allM (isTimeless <=< typeOfBV) $ filter (<= i) $ VSet.toList fvs

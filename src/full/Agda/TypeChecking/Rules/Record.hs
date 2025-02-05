@@ -6,7 +6,6 @@ module Agda.TypeChecking.Rules.Record where
 
 import Prelude hiding (null, not, (&&), (||))
 
-import Control.Monad
 import Data.Maybe
 import qualified Data.Set as Set
 
@@ -19,6 +18,7 @@ import Agda.Syntax.Internal
 import Agda.Syntax.Position
 import qualified Agda.Syntax.Info as Info
 
+import Agda.TypeChecking.Errors
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Primitive
 import Agda.TypeChecking.Substitute
@@ -30,6 +30,7 @@ import Agda.TypeChecking.Polarity
 import Agda.TypeChecking.Warnings
 import Agda.TypeChecking.CompiledClause (hasProjectionPatterns)
 import Agda.TypeChecking.CompiledClause.Compile
+import Agda.TypeChecking.InstanceArguments
 
 import Agda.TypeChecking.Rules.Data
   ( getGeneralizedParameters, bindGeneralizedParameters, bindParameters
@@ -41,12 +42,12 @@ import {-# SOURCE #-} Agda.TypeChecking.Rules.Decl (checkDecl)
 
 import Agda.Utils.Boolean
 import Agda.Utils.Function ( applyWhen )
+import Agda.Utils.Lens
 import Agda.Utils.List (headWithDefault)
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
 import Agda.Utils.POMonoid
-import Agda.Syntax.Common.Pretty (render)
 import qualified Agda.Syntax.Common.Pretty as P
 import Agda.Utils.Size
 
@@ -154,15 +155,8 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
 
       -- Obtain name of constructor (if present).
       (hasNamedCon, conName) <- case con of
-        Just c  -> return (True, c)
-        Nothing -> do
-          m <- killRange <$> currentModule
-          -- Andreas, 2020-06-01, AIM XXXII
-          -- Using prettyTCM here jinxes the printer, see PR #4699.
-          -- r <- prettyTCM name
-          let r = P.pretty $ qnameName name
-          c <- qualify m <$> freshName_ (render r ++ ".constructor")
-          return (False, c)
+        A.NamedRecCon c -> return (True, c)
+        A.FreshRecCon c -> return (False, c)
 
       -- Add record type to signature.
       reportSDoc "tc.rec" 15 $ "adding record type to signature"
@@ -186,27 +180,29 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
           -- Andreas, 2016-09-20, issue #2197.
           -- Eta is inferred by the positivity checker.
           -- We should turn it off until it is proven to be safe.
-          haveEta      = maybe (Inferred $ NoEta patCopat) Specified eta
-          -- haveEta      = maybe (Inferred $ conInduction == Inductive && etaenabled) Specified eta
+          noEta    = Inferred $ NoEta patCopat
+          haveEta0 = maybe noEta Specified eta
           con = ConHead conName (IsRecord patCopat) conInduction $ map argFromDom fs
 
           -- A record is irrelevant if all of its fields are.
           -- In this case, the associated module parameter will be irrelevant.
-          -- See issue 392.
+          -- See issue #392.
           -- Unless it's been declared coinductive or no-eta-equality (#2607).
           recordRelevance
-            | Just NoEta{} <- eta         = Relevant
-            | CoInductive <- conInduction = Relevant
-            | otherwise                   = minimum $ Irrelevant : map getRelevance (telToList ftel)
+            | Just NoEta{} <- eta         = relevant
+            | CoInductive <- conInduction = relevant
+            | null (telToList ftel)       = relevant    -- #6270: eta unit types don't need to be irrelevant
+            | otherwise                   = minimum $ irrelevant : map getRelevance (telToList ftel)
 
       -- Andreas, 2017-01-26, issue #2436
       -- Disallow coinductive records with eta-equality
-      when (conInduction == CoInductive && theEtaEquality haveEta == YesEta) $ do
-        typeError . GenericDocError =<< do
-          sep [ "Agda doesn't like coinductive records with eta-equality."
-              , "If you must, use pragma"
-              , "{-# ETA" <+> prettyTCM name <+> "#-}"
-              ]
+      -- Andreas, 2024-06-14, PR #7300
+      -- Just make this a deadcode warning.
+      haveEta <-
+        if (conInduction == CoInductive && theEtaEquality haveEta0 == YesEta) then do
+          noEta <$ do
+            setCurrentRange eta0 $ warning $ CoinductiveEtaRecord name
+        else pure haveEta0
       reportSDoc "tc.rec" 30 $ "record constructor is " <+> prettyTCM con
 
       -- Jesper, 2021-05-26: Warn when declaring coinductive record
@@ -225,7 +221,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
       let npars = size tel
           telh  = fmap hideAndRelParams tel
       escapeContext impossible npars $ do
-        addConstant' name defaultArgInfo name t $
+        addConstant' name defaultArgInfo t $
             Record
               { recPars           = npars
               , recClause         = Nothing
@@ -248,7 +244,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
 
         erasure <- optErasure <$> pragmaOptions
         -- Add record constructor to signature
-        addConstant' conName defaultArgInfo conName
+        addConstant' conName defaultArgInfo
              -- If --erasure is used, then the parameters are erased
              -- in the constructor's type.
             (applyWhen erasure (fmap $ applyQuantity zeroQuantity) telh
@@ -368,14 +364,15 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
           -- See test/Succeed/ProjectionsTakeModuleTelAsParameters.agda.
           tel' <- do
             r <- headWithDefault __IMPOSSIBLE__ <$> getContext
-            return $ telFromList' nameToArgName $ reverse $ r : params
+            return $ contextToTel $ r : params
           setModuleCheckpoint m
           checkRecordProjections m name hasNamedCon con tel' ftel fields
 
 
       -- we define composition here so that the projections are already in the signature.
-      escapeContext impossible npars $ do
-        addCompositionForRecord name haveEta con tel (map argFromDom fs) ftel rect
+      whenM cubicalCompatibleOption do
+        escapeContext impossible npars do
+          addCompositionForRecord name haveEta con tel (map argFromDom fs) ftel rect
 
       -- The confluence checker needs to know what symbols match against
       -- the constructor.
@@ -388,7 +385,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
   -- then switch on pattern matching for no-eta-equality.
   -- Default is no pattern matching, but definition by copatterns instead.
   patCopat = maybe CopatternMatching (const PatternMatching) pat
-  eta      = (patCopat <$) <$> eta0
+  eta      = ((patCopat <$) . rangedThing) <$> eta0
 
 
 addCompositionForRecord
@@ -497,7 +494,7 @@ defineKanOperationR cmd name params fsT fns rect = do
                   -- Γ = Δ, CompRArgs
                   -- pats = ... | phi = i1
                   -- body = u i1 itIsOne
-                  DoHComp  -> (2,Var 1 [] `apply` [argN io, setRelevance Irrelevant $ argN one])
+                  DoHComp  -> (2,Var 1 [] `apply` [argN io, setRelevance irrelevant $ argN one])
 
               p = ConP (ConHead io_name IsData Inductive [])
                        (noConPatternInfo { conPType = Just (Arg defaultArgInfo tInterval)
@@ -527,7 +524,6 @@ defineKanOperationR cmd name params fsT fns rect = do
                          , clauseBody      = Just $ rhs
                          , clauseType      = Just $ argN t
                          , clauseCatchall    = False
-                         , clauseExact       = Just True
                          , clauseRecursive   = Just False  -- definitely non-recursive!
                          , clauseUnreachable = Just False
                          , clauseEllipsis    = NoEllipsis
@@ -545,7 +541,6 @@ defineKanOperationR cmd name params fsT fns rect = do
                          , clauseBody      = Just body
                          , clauseType      = Just $ argN (unDom clause_ty)
                          , clauseCatchall    = False
-                         , clauseExact       = Just True
                          , clauseRecursive   = Nothing
                              -- Andreas 2020-02-06 TODO
                              -- Or: Just False;  is it known to be non-recursive?
@@ -638,7 +633,12 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
         then unless (getCohesion ai == Continuous)
                     -- Andrea TODO: properly update the context/type of the projection when we add Sharp
                     __IMPOSSIBLE__
-        else genericError $ "Cannot have record fields with modality " ++ show (getCohesion ai)
+        else typeError $ InvalidFieldModality (getCohesion ai)
+
+      -- For now, we forbid any polarity annotations on record fields (we would need to do as above,
+      -- and eta-equality or projection existence would be in danger).
+      unless (getModalPolarity ai `samePolarity` (withStandardLock MixedPolarity)) $
+        genericError $ "Cannot have record field with " ++ verbalize (getModalPolarity ai) ++ " polarity"
 
       -- The telescope tel includes the variable of record type as last one
       -- e.g. for cartesion product it is
@@ -697,10 +697,7 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
         -- 2012-04-02: DontCare instead of irrAxiom
 
         -- compute body modification for irrelevant projections
-        let bodyMod = case rel of
-              Relevant   -> id
-              NonStrict  -> id
-              Irrelevant -> dontCare
+        let bodyMod = applyWhen (isIrrelevant rel) dontCare
 
         let -- Andreas, 2010-09-09: comment for existing code
             -- split the telescope into parameters (ptel) and the type or the record
@@ -725,7 +722,6 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
                             , clauseBody      = body
                             , clauseType      = cltype
                             , clauseCatchall  = False
-                            , clauseExact       = Just True
                             , clauseRecursive   = Just False
                             , clauseUnreachable = Just False
                             , clauseEllipsis    = NoEllipsis
@@ -775,7 +771,8 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
                       Quantityω _ -> Quantityω QωInferred
                       q           -> q
           addConstant projname $
-            (defaultDefn ai' projname (killRange finalt) lang $ FunctionDefn
+            (defaultDefn ai' projname (killRange finalt) lang $ FunctionDefn $
+             set funProj_ True $
               fun
                 { _funClauses        = [clause]
                 , _funCompiled       = Just cc
@@ -789,8 +786,11 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
               }
           computePolarity [projname]
 
-        case Info.defInstance info of
-          -- fields do not have an @instance@ keyword!?
+        addContext ftel1 case Info.defInstance info of
+          -- Instance projections have to be added with their types "qua
+          -- local variable" (i.e. the type you'd get were you to open
+          -- the record module), but this type has to be treated in the
+          -- context ftel1 otherwise it's nonsense
           InstanceDef _r -> addTypedInstance projname t
           NotInstanceDef -> pure ()
 

@@ -6,14 +6,14 @@ module Agda.TypeChecking.Constraints where
 
 import Prelude hiding (null)
 
-import Control.Monad
-import Control.Monad.Except
+import Control.Monad.Except ( MonadError )
 
 import qualified Data.List as List
 import qualified Data.Set as Set
 import Data.Either
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty ( prettyShow )
 import Agda.Syntax.Internal
 
 import Agda.TypeChecking.Monad
@@ -37,11 +37,12 @@ import {-# SOURCE #-} Agda.TypeChecking.Lock
 import {-# SOURCE #-} Agda.TypeChecking.CheckInternal ( checkType )
 
 import Agda.Utils.CallStack ( withCurrentCallStack )
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
-import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty (prettyShow)
+import Agda.Utils.Null ()
 import qualified Agda.Utils.ProfileOptions as Profile
+import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
 
@@ -96,13 +97,13 @@ addConstraintTCM unblock c = do
           -- Get all level constraints.
           lvlcs <- instantiateFull =<< do
             List.filter (isLvl . clValue) . map theConstraint <$> getAllConstraints
-          unless (null lvlcs) $ do
+          List1.ifNull lvlcs (return Nothing) $ {-else-} \ lvlcs -> do
             reportSDoc "tc.constr.lvl" 40 $ vcat
               [ "simplifying level constraint" <+> prettyTCM c
               , nest 2 $ hang "using" 2 $ prettyTCM lvlcs
               ]
-          -- Try to simplify @c@ using the other constraints.
-          return $ simplifyLevelConstraint c $ map clValue lvlcs
+            -- Try to simplify @c@ using the other constraints.
+            return $ simplifyLevelConstraint c $ fmap clValue lvlcs
         | otherwise = return Nothing
 
 wakeConstraintsTCM :: (ProblemConstraint-> WakeUp) -> TCM ()
@@ -134,6 +135,7 @@ stealConstraintsTCM pid = do
   modifySleepingConstraints $ List.map rename
 
 
+{-# SPECIALIZE noConstraints :: TCM a -> TCM a #-}
 -- | Don't allow the argument to produce any blocking constraints.
 --
 -- WARNING: this does not mean that the given computation cannot
@@ -142,13 +144,26 @@ stealConstraintsTCM pid = do
 noConstraints
   :: (MonadConstraint m, MonadWarning m, MonadError TCErr m, MonadFresh ProblemId m)
   => m a -> m a
-noConstraints problem = do
+noConstraints = noConstraints' False
+
+-- | As noConstraints but also fail for non-blocking constraints.
+reallyNoConstraints
+  :: (MonadConstraint m, MonadWarning m, MonadError TCErr m, MonadFresh ProblemId m)
+  => m a -> m a
+reallyNoConstraints = noConstraints' True
+
+noConstraints'
+  :: (MonadConstraint m, MonadWarning m, MonadError TCErr m, MonadFresh ProblemId m)
+  => Bool -> m a -> m a
+noConstraints' includingNonBlocking problem = do
   (pid, x) <- newProblem problem
-  cs <- getConstraintsForProblem pid
-  unless (null cs) $ do
-    withCurrentCallStack $ \loc -> do
-      w <- warning'_ loc (UnsolvedConstraints cs)
-      typeError' loc $ NonFatalErrors [ w ]
+  let counts | includingNonBlocking = const True
+             | otherwise            = isBlockingConstraint . clValue . theConstraint
+  cs <- List.filter counts <$> getConstraintsForProblem pid
+  List1.ifNull cs (pure ()) \ cs -> do
+    withCurrentCallStack \ loc -> do
+      w <- warning'_ loc $ UnsolvedConstraints cs
+      typeError' loc $ NonFatalErrors $ singleton w
   return x
 
 -- | Run a computation that should succeeds without constraining
@@ -164,6 +179,7 @@ nonConstraining ::
   ) => m a -> m a
 nonConstraining = dontAssignMetas . noConstraints
 
+{-# SPECIALIZE newProblem :: TCM a -> TCM (ProblemId, a) #-}
 -- | Create a fresh problem for the given action.
 newProblem
   :: (MonadFresh ProblemId m, MonadConstraint m)
@@ -176,6 +192,7 @@ newProblem action = do
   solveAwakeConstraints
   return (pid, x)
 
+{-# SPECIALIZE newProblem_ :: TCM a -> TCM ProblemId #-}
 newProblem_
   :: (MonadFresh ProblemId m, MonadConstraint m)
   => m a -> m ProblemId
@@ -202,6 +219,7 @@ whenConstraints action handler =
     stealConstraints pid
     handler
 
+{-# SPECIALIZE wakeupConstraints :: MetaId -> TCM () #-}
 -- | Wake up the constraints depending on the given meta.
 wakeupConstraints :: MonadMetaSolver m => MetaId -> m ()
 wakeupConstraints x = do
@@ -281,10 +299,9 @@ solveConstraint_ (UnBlock m)                =   -- alwaysUnblock since these hav
       -- Ulf, 2018-04-30: The size solver shouldn't touch blocked terms! They have
       -- a twin meta that it's safe to solve.
       InstV{} -> __IMPOSSIBLE__
-      -- Open (whatever that means)
-      Open -> __IMPOSSIBLE__
-      OpenInstance -> __IMPOSSIBLE__
+      OpenMeta{} -> __IMPOSSIBLE__
 solveConstraint_ (FindInstance m cands) = findInstance m cands
+solveConstraint_ (ResolveInstanceHead q) = resolveInstanceHead q
 solveConstraint_ (CheckFunDef i q cs _err) = withoutCache $
   -- re #3498: checking a fundef would normally be cached, but here it's
   -- happening out of order so it would only corrupt the caching log.
@@ -300,9 +317,9 @@ solveConstraint_ (UsableAtModality cc ms mod t) = usableAtModality' ms cc mod t
 checkTypeCheckingProblem :: TypeCheckingProblem -> TCM Term
 checkTypeCheckingProblem = \case
   CheckExpr cmp e t              -> checkExpr' cmp e t
-  CheckArgs cmp eh r args t0 t1 k -> checkArguments cmp eh r args t0 t1 k
-  CheckProjAppToKnownPrincipalArg cmp e o ds args t k v0 pt patm ->
-    checkProjAppToKnownPrincipalArg cmp e o ds args t k v0 pt patm
+  CheckArgs cmp eh hd args t0 t1 k -> checkArguments cmp eh hd args t0 t1 k
+  CheckProjAppToKnownPrincipalArg cmp e o ds hd args t k v0 pt patm ->
+    checkProjAppToKnownPrincipalArg cmp e o ds hd args t k v0 pt patm
   CheckLambda cmp args body target -> checkPostponedLambda cmp args body target
   DoQuoteTerm cmp et t           -> doQuoteTerm cmp et t
 

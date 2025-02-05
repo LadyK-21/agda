@@ -3,38 +3,39 @@
 
 module Agda.TypeChecking.Serialise.Instances.Common (SerialisedRange(..)) where
 
-import Control.Monad              ( (<=<) )
+import qualified Control.Exception as E
+import Control.Monad              ( (<=<), (<$!>) )
 import Control.Monad.IO.Class     ( MonadIO(..) )
 import Control.Monad.Except       ( MonadError(..) )
 import Control.Monad.Reader       ( MonadReader(..), asks )
+import Control.Monad.State        ( runStateT )
 import Control.Monad.State.Strict ( gets, modify )
 
 import Data.Array.IArray
-import Data.Word
 import qualified Data.Foldable as Fold
 import Data.Hashable
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HMap
 import Data.Int (Int32)
-
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IntSet
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Set (Set)
-import qualified Data.IntSet as IntSet
-import Data.IntSet (IntSet)
-import qualified Data.Set as Set
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Strict.Tuple (Pair(..))
 import qualified Data.Text      as T
 import qualified Data.Text.Lazy as TL
 import Data.Typeable
-import Data.HashMap.Strict (HashMap)
-import qualified Data.HashMap.Strict as HMap
-
 import Data.Void
+import Data.Word (Word32, Word64)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Builtin
 import Agda.Syntax.Concrete.Name as C
+import Agda.Syntax.Concrete (RecordDirective(..))
 import qualified Agda.Syntax.Concrete as C
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Position as P
@@ -43,15 +44,21 @@ import Agda.Syntax.TopLevelModuleName
 import Agda.Interaction.FindFile
 import Agda.Interaction.Library
 
+import Agda.TypeChecking.Monad.Base.Types
 import Agda.TypeChecking.Serialise.Base
 
 import Agda.Utils.BiMap (BiMap)
 import qualified Agda.Utils.BiMap as BiMap
+import Agda.Utils.FileId (getIdFile)
 import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.List2 (List2(List2))
 import qualified Agda.Utils.List2 as List2
 import qualified Agda.Utils.Maybe.Strict as Strict
+import Agda.Utils.Null
+import Agda.Utils.SmallSet (SmallSet(..))
+import Agda.Utils.Set1 (Set1)
+import qualified Agda.Utils.Set1 as Set1
 import Agda.Utils.Trie (Trie(..))
 import Agda.Utils.WithDefault
 
@@ -60,46 +67,52 @@ import Agda.Utils.CallStack
 
 instance {-# OVERLAPPING #-} EmbPrj String where
   icod_   = icodeString
-  value i = (! i) `fmap` gets stringE
+  value i = (! i) <$!> gets stringE
 
 instance EmbPrj TL.Text where
   icod_   = icodeX lTextD lTextC
-  value i = (! i) `fmap` gets lTextE
+  value i = (! i) <$!> gets lTextE
 
 instance EmbPrj T.Text where
   icod_   = icodeX sTextD sTextC
-  value i = (! i) `fmap` gets sTextE
+  value i = (! i) <$!> gets sTextE
 
 instance EmbPrj Integer where
   icod_   = icodeInteger
-  value i = (! i) `fmap` gets integerE
+  value i = (! i) <$!> gets integerE
 
 instance EmbPrj Word64 where
-  icod_ i = icodeN' (undefined :: Int32 -> Int32 -> Int32) (int32 q) (int32 r)
-    where (q, r) = quotRem i (2^32)
-          int32 :: Word64 -> Int32
-          int32 = fromIntegral
+  icod_ i = icodeN' (undefined :: Word32 -> Word32 -> Word32) (word32 q) (word32 r)
+    where (q, r) = quotRem i (2 ^ 32)
+          word32 :: Word64 -> Word32
+          word32 = fromIntegral
 
   value = vcase valu where
-    valu [a, b] = return $ n * mod (fromIntegral a) n + mod (fromIntegral b) n
+    valu [a, b] = return $! n * fromIntegral a + fromIntegral b
     valu _      = malformed
-    n = 2^32
+    n = 2 ^ 32
 
-instance EmbPrj Int32 where
+instance EmbPrj Word32 where
   icod_ i = return i
   value i = return i
 
+-- Andreas, Agda Hackathon 2024-10-15
+-- Are we sure we never use an Int that does not fit into 32 bits?
 instance EmbPrj Int where
-  icod_ i = return (fromIntegral i)
-  value i = return (fromIntegral i)
+  icod_ i = return $! fromIntegral i
+  value i = return $! fromIntegral i
+
+instance EmbPrj Int32 where
+  icod_ i = return $! fromIntegral i
+  value i = return $! fromIntegral i
 
 instance EmbPrj Char where
-  icod_ c = return (fromIntegral $ fromEnum c)
-  value i = return (toEnum $ fromInteger $ toInteger i)
+  icod_ c = return $! fromIntegral $ fromEnum c
+  value i = return $! toEnum $ fromInteger $ toInteger i
 
 instance EmbPrj Double where
   icod_   = icodeDouble
-  value i = (! i) `fmap` gets doubleE
+  value i = (! i) <$!> gets doubleE
 
 instance EmbPrj Void where
   icod_ = absurd
@@ -146,7 +159,7 @@ instance EmbPrj a => EmbPrj (Maybe a) where
 
 instance EmbPrj a => EmbPrj (Strict.Maybe a) where
   icod_ m = icode (Strict.toLazy m)
-  value m = Strict.toStrict `fmap` value m
+  value m = Strict.toStrict <$!> value m
 
 instance EmbPrj Bool where
   icod_ False = pure 0
@@ -156,6 +169,8 @@ instance EmbPrj Bool where
   value 1 = pure True
   value _ = malformed
 
+instance EmbPrj ConstructorOrPatternSynonym
+
 instance EmbPrj FileType where
   icod_ AgdaFileType  = pure 0
   icod_ MdFileType    = pure 1
@@ -163,6 +178,7 @@ instance EmbPrj FileType where
   icod_ TexFileType   = pure 3
   icod_ OrgFileType   = pure 4
   icod_ TypstFileType = pure 5
+  icod_ TreeFileType  = pure 6
 
   value = \case
     0 -> pure AgdaFileType
@@ -171,6 +187,7 @@ instance EmbPrj FileType where
     3 -> pure TexFileType
     4 -> pure OrgFileType
     5 -> pure TypstFileType
+    6 -> pure TreeFileType
     _ -> malformed
 
 instance EmbPrj Cubical where
@@ -214,13 +231,12 @@ instance EmbPrj TopLevelModuleName where
   value = valueN TopLevelModuleName
 
 instance {-# OVERLAPPABLE #-} EmbPrj a => EmbPrj [a] where
-  icod_ xs = icodeNode =<< mapM icode xs
-  value    = vcase (mapM value)
---   icode []       = icode0'
---   icode (x : xs) = icode2' x xs
---   value = vcase valu where valu []      = valu0 []
---                            valu [x, xs] = valu2 (:) x xs
---                            valu _       = malformed
+  icod_ xs = icodeNode =<< go xs where
+    go :: [a] -> S Node
+    go []     = pure Empty
+    go (a:as) = do {n <- icode a; ns <- go as; pure $! Cons n ns}
+
+  value = vcase (mapM value)
 
 instance EmbPrj a => EmbPrj (List1 a) where
   icod_ = icod_ . List1.toList
@@ -233,41 +249,49 @@ instance EmbPrj a => EmbPrj (List2 a) where
 instance (EmbPrj k, EmbPrj v, EmbPrj (BiMap.Tag v)) =>
          EmbPrj (BiMap k v) where
   icod_ m = icode (BiMap.toDistinctAscendingLists m)
-  value m = BiMap.fromDistinctAscendingLists <$> value m
+  value m = BiMap.fromDistinctAscendingLists <$!> value m
 
 
 -- | Encode a list of key-value pairs as a flat list.
-mapPairsIcode :: (EmbPrj k, EmbPrj v) => [(k, v)] -> S Int32
-mapPairsIcode xs = icodeNode =<< convert [] xs where
+mapPairsIcode :: (EmbPrj k, EmbPrj v) => [(k, v)] -> S Word32
+mapPairsIcode xs = icodeNode =<< convert Empty xs where
   -- As we need to call `convert' in the tail position, the resulting list is
   -- written (and read) in reverse order, with the highest pair first in the
   -- resulting list.
-  convert ys [] = return ys
-  convert ys ((start, entry):xs) = do
+  convert !ys [] = return ys
+  convert  ys ((start, entry):xs) = do
     start <- icode start
     entry <- icode entry
-    convert (start:entry:ys) xs
+    convert (Cons start (Cons entry ys)) xs
 
-mapPairsValue :: (EmbPrj k, EmbPrj v) => [Int32] -> R [(k, v)]
+mapPairsValue :: (EmbPrj k, EmbPrj v) => [Word32] -> R [(k, v)]
 mapPairsValue = convert [] where
   convert ys [] = return ys
   convert ys (start:entry:xs) = do
-    start <- value start
-    entry <- value entry
+    !start <- value start
+    !entry <- value entry
     convert ((start, entry):ys) xs
   convert _ _ = malformed
 
 instance (Ord a, EmbPrj a, EmbPrj b) => EmbPrj (Map a b) where
   icod_ m = mapPairsIcode (Map.toAscList m)
-  value = vcase (fmap Map.fromDistinctAscList . mapPairsValue)
+  value = vcase ((Map.fromDistinctAscList <$!>) . mapPairsValue)
 
 instance (Ord a, EmbPrj a) => EmbPrj (Set a) where
   icod_ s = icode (Set.toAscList s)
-  value s = Set.fromDistinctAscList <$> value s
+  value s = Set.fromDistinctAscList <$!> value s
+
+instance (Ord a, EmbPrj a) => EmbPrj (Set1 a) where
+  icod_ s = icode (Set1.toAscList s)
+  value s = Set1.fromDistinctAscList <$!> value s
 
 instance EmbPrj IntSet where
   icod_ s = icode (IntSet.toAscList s)
-  value s = IntSet.fromDistinctAscList <$> value s
+  value s = IntSet.fromDistinctAscList <$!> value s
+
+instance Typeable a => EmbPrj (SmallSet a) where
+  icod_ (SmallSet a) = icodeN' SmallSet a
+  value = valueN SmallSet
 
 instance (Ord a, EmbPrj a, EmbPrj b) => EmbPrj (Trie a b) where
   icod_ (Trie a b)= icodeN' Trie a b
@@ -276,10 +300,10 @@ instance (Ord a, EmbPrj a, EmbPrj b) => EmbPrj (Trie a b) where
 
 instance EmbPrj a => EmbPrj (Seq a) where
   icod_ s = icode (Fold.toList s)
-  value s = Seq.fromList `fmap` value s
+  value s = Seq.fromList <$!> value s
 
 instance EmbPrj a => EmbPrj (P.Interval' a) where
-  icod_ (P.Interval p q) = icodeN' P.Interval p q
+  icod_ (P.Interval f p q) = icodeN' P.Interval f p q
 
   value = valueN P.Interval
 
@@ -292,17 +316,23 @@ instance EmbPrj RangeFile where
             <- value r
     mf      <- gets modFile
     incs    <- gets includes
-    (r, mf) <- liftIO $ findFile'' incs m mf
+    (r, mf) <- liftIO $ runStateT (findFile'' incs m) mf
     modify $ \s -> s { modFile = mf }
     case r of
-      Left err -> throwError $ findErrorToTypeError m err
-      Right f  -> return $ RangeFile (srcFilePath f) (Just m)
+      Left err -> liftIO $ E.throwIO $ E.ErrorCall $ "file not found: " ++ show err
+      Right (SourceFile i)  -> do
+        let fp = getIdFile (fileDict mf) i
+        return $ RangeFile fp (Just m)
 
 -- | Ranges are always deserialised as 'noRange'.
 
 instance EmbPrj Range where
   icod_ _ = icodeN' ()
   value _ = return noRange
+
+instance EmbPrj KwRange where
+  icod_ _ = icodeN' ()
+  value _ = return empty
 
 -- | Ranges that should be serialised properly.
 
@@ -311,7 +341,7 @@ newtype SerialisedRange = SerialisedRange { underlyingRange :: Range }
 instance EmbPrj SerialisedRange where
   icod_ (SerialisedRange r) = icodeN' P.intervalsToRange (P.rangeFile r) (P.rangeIntervals r)
 
-  value i = SerialisedRange <$> valueN P.intervalsToRange i
+  value i = SerialisedRange <$!> valueN P.intervalsToRange i
 
 instance EmbPrj C.Name where
   icod_ (C.NoName a b)     = icodeN 0 C.NoName a b
@@ -409,7 +439,12 @@ instance EmbPrj NotationPart where
 instance EmbPrj MetaId where
   icod_ (MetaId a b) = icode (a, b)
 
-  value m = uncurry MetaId <$> value m
+  value m = uncurry MetaId <$!> value m
+
+instance EmbPrj ProblemId where
+  icod_ (ProblemId a) = icode a
+
+  value m = ProblemId <$!> value m
 
 instance EmbPrj A.QName where
   icod_ n@(A.QName a b) = icodeMemo qnameD qnameC (qnameId n) $ icodeN' A.QName a b
@@ -418,11 +453,11 @@ instance EmbPrj A.QName where
 
 instance EmbPrj A.AmbiguousQName where
   icod_ (A.AmbQ a) = icode a
-  value n          = A.AmbQ `fmap` value n
+  value n          = A.AmbQ <$!> value n
 
 instance EmbPrj A.ModuleName where
   icod_ (A.MName a) = icode a
-  value n           = A.MName `fmap` value n
+  value n           = A.MName <$!> value n
 
 instance EmbPrj A.Name where
   icod_ (A.Name a b c d e f) = icodeMemo nameD nameC a $
@@ -467,7 +502,7 @@ instance EmbPrj OpaqueId where
 
 instance (Eq k, Hashable k, EmbPrj k, EmbPrj v) => EmbPrj (HashMap k v) where
   icod_ m = mapPairsIcode (HMap.toList m)
-  value = vcase (fmap HMap.fromList . mapPairsValue)
+  value = vcase ((HMap.fromList <$!>) . mapPairsValue)
 
 instance EmbPrj a => EmbPrj (WithHiding a) where
   icod_ (WithHiding a b) = icodeN' WithHiding a b
@@ -489,6 +524,7 @@ instance EmbPrj a => EmbPrj (HasEta' a) where
     valu _   = malformed
 
 instance EmbPrj PatternOrCopattern
+instance EmbPrj OverlapMode
 
 instance EmbPrj Induction where
   icod_ Inductive   = icodeN' Inductive
@@ -580,22 +616,86 @@ instance EmbPrj Cohesion where
   value 2 = return Squash
   value _ = malformed
 
+instance EmbPrj ModalPolarity where
+  icod_ UnusedPolarity = return 0
+  icod_ StrictlyPositive = return 1
+  icod_ Positive = return 2
+  icod_ Negative = return 3
+  icod_ MixedPolarity = return 4
+
+  value 0 = return UnusedPolarity
+  value 1 = return StrictlyPositive
+  value 2 = return Positive
+  value 3 = return Negative
+  value 4 = return MixedPolarity
+  value _ = malformed
+
+instance EmbPrj PolarityModality where
+  icod_ (PolarityModality p o l) = icod_ (p, o, l)
+
+  value n = do
+    (p, o, l) <- polPair
+    return $ PolarityModality p o l
+    where
+      polPair :: R (ModalPolarity, ModalPolarity, ModalPolarity)
+      polPair = value n
+
 instance EmbPrj Modality where
-  icod_ (Modality a b c) = icodeN' Modality a b c
+  icod_ (Modality a b c d) = icodeN' Modality a b c d
 
   value = vcase $ \case
-    [a, b, c] -> valuN Modality a b c
+    [a, b, c, d] -> valuN Modality a b c d
+    _ -> malformed
+
+instance EmbPrj OriginRelevant where
+  icod_ = \case
+    ORelInferred   -> return 0
+    ORelRelevant _ -> return 1
+
+  value = \case
+    0 -> return $ ORelInferred
+    1 -> return $ ORelRelevant noRange
+    _ -> malformed
+
+instance EmbPrj OriginIrrelevant where
+  icod_ = \case
+    OIrrInferred     -> return 0
+    OIrrDot _        -> return 1
+    OIrrIrr _        -> return 2
+    OIrrIrrelevant _ -> return 3
+
+  value = \case
+    0 -> return $ OIrrInferred
+    1 -> return $ OIrrDot        noRange
+    2 -> return $ OIrrIrr        noRange
+    3 -> return $ OIrrIrrelevant noRange
+    _ -> malformed
+
+instance EmbPrj OriginShapeIrrelevant where
+  icod_ = \case
+    OShIrrInferred          -> return 0
+    OShIrrDotDot _          -> return 1
+    OShIrrShIrr _           -> return 2
+    OShIrrShapeIrrelevant _ -> return 3
+
+  value = \case
+    0 -> return $ OShIrrInferred
+    1 -> return $ OShIrrDotDot          noRange
+    2 -> return $ OShIrrShIrr           noRange
+    3 -> return $ OShIrrShapeIrrelevant noRange
     _ -> malformed
 
 instance EmbPrj Relevance where
-  icod_ Relevant       = return 0
-  icod_ Irrelevant     = return 1
-  icod_ NonStrict      = return 2
+  icod_ = \case
+    Relevant   a      -> icodeN' Relevant a
+    Irrelevant a      -> icodeN 0 Irrelevant a
+    ShapeIrrelevant a -> icodeN 1 ShapeIrrelevant a
 
-  value 0 = return Relevant
-  value 1 = return Irrelevant
-  value 2 = return NonStrict
-  value _ = malformed
+  value = vcase \case
+    [a]    -> valuN Relevant a
+    [0, a] -> valuN Irrelevant a
+    [1, a] -> valuN ShapeIrrelevant a
+    _      -> malformed
 
 instance EmbPrj Annotation where
   icod_ (Annotation l) = icodeN' Annotation l
@@ -619,6 +719,7 @@ instance EmbPrj Origin where
   icod_ CaseSplit   = return 3
   icod_ Substitution = return 4
   icod_ ExpandedPun = return 5
+  icod_ Generalization = return 6
 
   value 0 = return UserWritten
   value 1 = return Inserted
@@ -626,6 +727,7 @@ instance EmbPrj Origin where
   value 3 = return CaseSplit
   value 4 = return Substitution
   value 5 = return ExpandedPun
+  value 6 = return Generalization
   value _ = malformed
 
 instance EmbPrj a => EmbPrj (WithOrigin a) where
@@ -643,15 +745,17 @@ instance EmbPrj FreeVariables where
     valu _   = malformed
 
 instance EmbPrj ConOrigin where
-  icod_ ConOSystem = return 0
-  icod_ ConOCon    = return 1
-  icod_ ConORec    = return 2
-  icod_ ConOSplit  = return 3
+  icod_ ConOSystem   = return 0
+  icod_ ConOCon      = return 1
+  icod_ ConORec      = return 2
+  icod_ ConOSplit    = return 3
+  icod_ ConORecWhere = return 4
 
   value 0 = return ConOSystem
   value 1 = return ConOCon
   value 2 = return ConORec
   value 3 = return ConOSplit
+  value 4 = return ConORecWhere
   value _ = malformed
 
 instance EmbPrj ProjOrigin where
@@ -707,7 +811,7 @@ instance EmbPrj SrcLoc where
 
 instance EmbPrj CallStack where
   icod_ = icode . getCallStack
-  value = fmap fromCallSiteList . value
+  value = (<$!>) fromCallSiteList . value
 
 instance EmbPrj Impossible where
   icod_ (Impossible a)              = icodeN 0 Impossible a
@@ -732,7 +836,7 @@ instance EmbPrj ExpandedEllipsis where
 instance EmbPrj OptionsPragma where
   icod_ (OptionsPragma a b) = icod_ (a, b)
 
-  value op = uncurry OptionsPragma <$> value op
+  value op = uncurry OptionsPragma <$!> value op
 
 instance EmbPrj BuiltinId
 instance EmbPrj PrimitiveId
@@ -745,3 +849,34 @@ instance EmbPrj SomeBuiltin where
     valu [0, x] = valuN BuiltinName x
     valu [1, x] = valuN PrimitiveName x
     valu _      = malformed
+
+instance EmbPrj IsInstance where
+  icod_ = \case
+    InstanceDef a  -> icodeN' InstanceDef a
+    NotInstanceDef -> icodeN' NotInstanceDef
+
+  value = vcase \case
+    [a] -> valuN InstanceDef a
+    []  -> valuN NotInstanceDef
+    _ -> malformed
+
+instance EmbPrj a => EmbPrj (RecordDirectives' a) where
+  icod_ (RecordDirectives a b c d) = icodeN' RecordDirectives a b c d
+
+  value = vcase \case
+    [a, b, c, d] -> valuN RecordDirectives a b c d
+    _ -> malformed
+
+instance EmbPrj RecordDirective where
+  icod_ = \case
+    Constructor a b      -> icodeN 0 Constructor a b
+    Eta a                -> icodeN 1 Eta a
+    Induction a          -> icodeN 2 Induction a
+    PatternOrCopattern a -> icodeN 3 PatternOrCopattern a
+
+  value = vcase \case
+    [0, a, b] -> valuN Constructor a b
+    [1, a]    -> valuN Eta a
+    [2, a]    -> valuN Induction a
+    [3, a]    -> valuN PatternOrCopattern a
+    _ -> malformed

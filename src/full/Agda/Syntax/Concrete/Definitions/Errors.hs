@@ -17,6 +17,8 @@ import Agda.Utils.CallStack ( CallStack )
 import Agda.Utils.List1 (List1, pattern (:|))
 import Agda.Utils.List2 (List2, pattern List2)
 import qualified Agda.Utils.List1 as List1
+import Agda.Utils.Set1 (Set1)
+import qualified Agda.Utils.Set1 as Set1
 import Agda.Utils.Singleton
 
 ------------------------------------------------------------------------
@@ -31,12 +33,10 @@ data DeclarationException = DeclarationException
 -- | The exception type.
 data DeclarationException'
   = MultipleEllipses Pattern
-  | InvalidName Name
   | DuplicateDefinition Name
   | DuplicateAnonDeclaration Range
   | MissingWithClauses Name LHS
   | WrongDefinition Name DataRecOrFun DataRecOrFun
-  | DeclarationPanic String
   | WrongContentBlock KindOfBlock Range
   | AmbiguousFunClauses LHS (List1 Name)
       -- ^ In a mutual block, a clause could belong to any of the ≥2 type signatures ('Name').
@@ -44,20 +44,39 @@ data DeclarationException'
       -- ^ In an interleaved mutual block, a constructor could belong to any of the data signatures ('Name')
   | InvalidMeasureMutual Range
       -- ^ In a mutual block, all or none need a MEASURE pragma.
-      --   Range is of mutual block.
+      --   'Range' is the one of the offending pragma or the mutual block.
   | UnquoteDefRequiresSignature (List1 Name)
   | BadMacroDef NiceDeclaration
-  | UnfoldingOutsideOpaque Range
+  | UnfoldingOutsideOpaque KwRange
     -- ^ An unfolding declaration was not the first declaration
     -- contained in an opaque block.
-  | OpaqueInMutual Range
-      -- ^ @opaque@ block nested in a @mutual@ block. This can never
-      -- happen, even with reordering.
-  | DisallowedInterleavedMutual Range String (List1 Name)
+  | OpaqueInMutual KwRange
+      -- ^ @opaque@ block nested in a @mutual@ block.
+      -- This can never happen, even with reordering.
+      -- The 'KwRange' is the one of the @opaque@ keyword.
+  | DisallowedInterleavedMutual KwRange String (List1 Name)
       -- ^ A declaration that breaks an implicit mutual block (named by
       -- the String argument) was present while the given lone type
       -- signatures were still without their definitions.
-    deriving Show
+    deriving (Show, Generic)
+
+-- | The name of the error.
+declarationExceptionString :: DeclarationException' -> String
+declarationExceptionString = \case
+  MultipleEllipses            {} -> "MultipleEllipses"
+  DuplicateDefinition         {} -> "DuplicateDefinition"
+  DuplicateAnonDeclaration    {} -> "DuplicateAnonDeclaration"
+  MissingWithClauses          {} -> "MissingWithClauses"
+  WrongDefinition             {} -> "WrongDefinition"
+  WrongContentBlock           {} -> "WrongContentBlock"
+  AmbiguousFunClauses         {} -> "AmbiguousFunClauses"
+  AmbiguousConstructor        {} -> "AmbiguousConstructor"
+  InvalidMeasureMutual        {} -> "InvalidMeasureMutual"
+  UnquoteDefRequiresSignature {} -> "UnquoteDefRequiresSignature"
+  BadMacroDef                 {} -> "BadMacroDef"
+  UnfoldingOutsideOpaque      {} -> "UnfoldingOutsideOpaque"
+  OpaqueInMutual              {} -> "OpaqueInMutual"
+  DisallowedInterleavedMutual {} -> "DisallowedInterleavedMutual"
 
 ------------------------------------------------------------------------
 -- Warnings
@@ -69,17 +88,19 @@ data DeclarationWarning = DeclarationWarning
 
 -- | Non-fatal errors encountered in the Nicifier.
 data DeclarationWarning'
-  -- Please keep in alphabetical order.
-  = EmptyAbstract Range    -- ^ Empty @abstract@  block.
-  | EmptyConstructor Range -- ^ Empty @constructor@ block.
-  | EmptyField Range       -- ^ Empty @field@     block.
-  | EmptyGeneralize Range  -- ^ Empty @variable@  block.
-  | EmptyInstance Range    -- ^ Empty @instance@  block
-  | EmptyMacro Range       -- ^ Empty @macro@     block.
-  | EmptyMutual Range      -- ^ Empty @mutual@    block.
-  | EmptyPostulate Range   -- ^ Empty @postulate@ block.
-  | EmptyPrivate Range     -- ^ Empty @private@   block.
-  | EmptyPrimitive Range   -- ^ Empty @primitive@ block.
+  -- Please keep in (mostly) alphabetical order.
+  = EmptyAbstract    KwRange  -- ^ Empty @abstract@     block.
+  | EmptyConstructor KwRange  -- ^ Empty @data _ where@ block.
+  | EmptyField       KwRange  -- ^ Empty @field@        block.
+  | EmptyGeneralize  KwRange  -- ^ Empty @variable@     block.
+  | EmptyInstance    KwRange  -- ^ Empty @instance@     block
+  | EmptyMacro       KwRange  -- ^ Empty @macro@        block.
+  | EmptyMutual      KwRange  -- ^ Empty @mutual@       block.
+  | EmptyPostulate   KwRange  -- ^ Empty @postulate@    block.
+  | EmptyPrivate     KwRange  -- ^ Empty @private@      block.
+  | EmptyPrimitive   KwRange  -- ^ Empty @primitive@    block.
+  | EmptyPolarityPragma Range
+      -- ^ POLARITY pragma without any polarities.
   | HiddenGeneralize Range
       -- ^ A 'Hidden' identifier in a @variable@ declaration.
       --   Hiding has no effect there as generalized variables are always hidden
@@ -87,8 +108,6 @@ data DeclarationWarning'
   | InvalidCatchallPragma Range
       -- ^ A {-\# CATCHALL \#-} pragma
       --   that does not precede a function clause.
-  | InvalidConstructor Range
-      -- ^ Invalid definition in a constructor block
   | InvalidConstructorBlock Range
       -- ^ Invalid constructor block (not inside an interleaved mutual block)
   | InvalidCoverageCheckPragma Range
@@ -99,21 +118,21 @@ data DeclarationWarning'
   | InvalidNoUniverseCheckPragma Range
       -- ^ A {-\# NO_UNIVERSE_CHECK \#-} pragma
       --   that does not apply to a data or record type.
-  | InvalidRecordDirective Range
-      -- ^ A record directive outside of a record / below existing fields.
   | InvalidTerminationCheckPragma Range
       -- ^ A {-\# TERMINATING \#-} and {-\# NON_TERMINATING \#-} pragma
       --   that does not apply to any function.
-  | MissingDeclarations [(Name, Range)]
-      -- ^ Definitions (e.g. constructors or functions) without a declaration.
-  | MissingDefinitions [(Name, Range)]
+  | MissingDataDeclaration Name
+      -- ^ A @data@ definition without a @data@ signature.
+  | MissingDefinitions (List1 (Name, Range))
       -- ^ Declarations (e.g. type signatures) without a definition.
   | NotAllowedInMutual Range String
-  | OpenPublicPrivate Range
+  | OpenPublicPrivate KwRange
       -- ^ @private@ has no effect on @open public@.  (But the user might think so.)
-  | OpenPublicAbstract Range
+      --   'KwRange' is the range of the @public@ keyword.
+  | OpenPublicAbstract KwRange
       -- ^ @abstract@ has no effect on @open public@.  (But the user might think so.)
-  | PolarityPragmasButNotPostulates [Name]
+      --   'KwRange' is the range of the @public@ keyword.
+  | PolarityPragmasButNotPostulates (Set1 Name)
   | PragmaNoTerminationCheck Range
       -- ^ Pragma @{-\# NO_TERMINATION_CHECK \#-}@ has been replaced
       --   by @{-\# TERMINATING \#-}@ and @{-\# NON_TERMINATING \#-}@.
@@ -128,14 +147,16 @@ data DeclarationWarning'
   | SafeFlagPolarity          Range -- ^ @POLARITY@            pragma is unsafe.
   | SafeFlagTerminating       Range -- ^ @TERMINATING@         pragma is unsafe.
   | ShadowingInTelescope (List1 (Name, List2 Range))
-  | UnknownFixityInMixfixDecl [Name]
-  | UnknownNamesInFixityDecl [Name]
-  | UnknownNamesInPolarityPragmas [Name]
-  | UselessAbstract Range
+  | UnknownFixityInMixfixDecl (Set1 Name)
+  | UnknownNamesInFixityDecl (Set1 Name)
+  | UnknownNamesInPolarityPragmas (Set1 Name)
+  | UselessAbstract KwRange
       -- ^ @abstract@ block with nothing that can (newly) be made abstract.
-  | UselessInstance Range
+  | UselessInstance KwRange
       -- ^ @instance@ block with nothing that can (newly) become an instance.
-  | UselessPrivate Range
+  | UselessMacro KwRange
+      -- ^ @macro@ block with nothing that can (newly) be made macro.
+  | UselessPrivate KwRange
       -- ^ @private@ block with nothing that can (newly) be made private.
   deriving (Show, Generic)
 
@@ -155,16 +176,15 @@ declarationWarningName' = \case
   EmptyPrivate{}                    -> EmptyPrivate_
   EmptyPostulate{}                  -> EmptyPostulate_
   EmptyPrimitive{}                  -> EmptyPrimitive_
+  EmptyPolarityPragma{}             -> EmptyPolarityPragma_
   HiddenGeneralize{}                -> HiddenGeneralize_
   InvalidCatchallPragma{}           -> InvalidCatchallPragma_
-  InvalidConstructor{}              -> InvalidConstructor_
   InvalidConstructorBlock{}         -> InvalidConstructorBlock_
   InvalidNoPositivityCheckPragma{}  -> InvalidNoPositivityCheckPragma_
   InvalidNoUniverseCheckPragma{}    -> InvalidNoUniverseCheckPragma_
-  InvalidRecordDirective{}          -> InvalidRecordDirective_
   InvalidTerminationCheckPragma{}   -> InvalidTerminationCheckPragma_
   InvalidCoverageCheckPragma{}      -> InvalidCoverageCheckPragma_
-  MissingDeclarations{}             -> MissingDeclarations_
+  MissingDataDeclaration{}          -> MissingDataDeclaration_
   MissingDefinitions{}              -> MissingDefinitions_
   NotAllowedInMutual{}              -> NotAllowedInMutual_
   OpenPublicPrivate{}               -> OpenPublicPrivate_
@@ -186,6 +206,7 @@ declarationWarningName' = \case
   UnknownNamesInPolarityPragmas{}   -> UnknownNamesInPolarityPragmas_
   UselessAbstract{}                 -> UselessAbstract_
   UselessInstance{}                 -> UselessInstance_
+  UselessMacro{}                    -> UselessMacro_
   UselessPrivate{}                  -> UselessPrivate_
 
 -- | Nicifier warnings turned into errors in @--safe@ mode.
@@ -205,16 +226,15 @@ unsafeDeclarationWarning' = \case
   EmptyPrivate{}                    -> False
   EmptyPostulate{}                  -> False
   EmptyPrimitive{}                  -> False
+  EmptyPolarityPragma{}             -> False
   HiddenGeneralize{}                -> False
   InvalidCatchallPragma{}           -> False
-  InvalidConstructor{}              -> False
   InvalidConstructorBlock{}         -> False
   InvalidNoPositivityCheckPragma{}  -> False
   InvalidNoUniverseCheckPragma{}    -> False
-  InvalidRecordDirective{}          -> False
   InvalidTerminationCheckPragma{}   -> False
   InvalidCoverageCheckPragma{}      -> False
-  MissingDeclarations{}             -> True  -- not safe
+  MissingDataDeclaration{}          -> True  -- not safe
   MissingDefinitions{}              -> True  -- not safe
   NotAllowedInMutual{}              -> False -- really safe?
   OpenPublicPrivate{}               -> False
@@ -236,6 +256,7 @@ unsafeDeclarationWarning' = \case
   UnknownNamesInPolarityPragmas{}   -> False
   UselessAbstract{}                 -> False
   UselessInstance{}                 -> False
+  UselessMacro{}                    -> False
   UselessPrivate{}                  -> False
 
 -- | Pragmas not allowed in @--safe@ mode produce an 'unsafeDeclarationWarning'.
@@ -251,6 +272,7 @@ unsafePragma p =
     ForeignPragma{}            -> empty
     ImpossiblePragma{}         -> empty
     InjectivePragma{}          -> singleton $ SafeFlagInjective r
+    InjectiveForInferencePragma{} -> empty
     InlinePragma{}             -> empty
     NoCoverageCheckPragma{}    -> singleton $ SafeFlagNoCoverageCheck r
     NoPositivityCheckPragma{}  -> singleton $ SafeFlagNoPositivityCheck r
@@ -273,6 +295,7 @@ unsafePragma p =
         NoTerminationCheck     -> empty
     WarningOnImport{}          -> empty
     WarningOnUsage{}           -> empty
+    OverlapPragma{}            -> empty
   where
     r = getRange p
 
@@ -284,51 +307,48 @@ instance HasRange DeclarationException where
 
 instance HasRange DeclarationException' where
   getRange (MultipleEllipses d)                 = getRange d
-  getRange (InvalidName x)                      = getRange x
   getRange (DuplicateDefinition x)              = getRange x
   getRange (DuplicateAnonDeclaration r)         = r
   getRange (MissingWithClauses x lhs)           = getRange lhs
   getRange (WrongDefinition x k k')             = getRange x
   getRange (AmbiguousFunClauses lhs xs)         = getRange lhs
   getRange (AmbiguousConstructor r _ _)         = r
-  getRange (DeclarationPanic _)                 = noRange
   getRange (WrongContentBlock _ r)              = r
   getRange (InvalidMeasureMutual r)             = r
-  getRange (UnquoteDefRequiresSignature x)      = getRange x
+  getRange (UnquoteDefRequiresSignature xs)     = getRange xs
   getRange (BadMacroDef d)                      = getRange d
-  getRange (UnfoldingOutsideOpaque r)           = r
-  getRange (OpaqueInMutual r)                   = r
-  getRange (DisallowedInterleavedMutual r _ _)  = r
+  getRange (UnfoldingOutsideOpaque kwr)         = getRange kwr
+  getRange (OpaqueInMutual kwr)                 = getRange kwr
+  getRange (DisallowedInterleavedMutual kwr _ _)= getRange kwr
 
 instance HasRange DeclarationWarning where
   getRange (DeclarationWarning _ w) = getRange w
 
 instance HasRange DeclarationWarning' where
   getRange = \case
-    EmptyAbstract r                    -> r
-    EmptyConstructor r                 -> r
-    EmptyField r                       -> r
-    EmptyGeneralize r                  -> r
-    EmptyInstance r                    -> r
-    EmptyMacro r                       -> r
-    EmptyMutual r                      -> r
-    EmptyPostulate r                   -> r
-    EmptyPrimitive r                   -> r
-    EmptyPrivate r                     -> r
+    EmptyAbstract kwr                  -> getRange kwr
+    EmptyConstructor kwr               -> getRange kwr
+    EmptyField kwr                     -> getRange kwr
+    EmptyGeneralize kwr                -> getRange kwr
+    EmptyInstance kwr                  -> getRange kwr
+    EmptyMacro kwr                     -> getRange kwr
+    EmptyMutual kwr                    -> getRange kwr
+    EmptyPostulate kwr                 -> getRange kwr
+    EmptyPrimitive kwr                 -> getRange kwr
+    EmptyPrivate kwr                   -> getRange kwr
+    EmptyPolarityPragma r              -> r
     HiddenGeneralize r                 -> r
     InvalidCatchallPragma r            -> r
-    InvalidConstructor r               -> r
     InvalidConstructorBlock r          -> r
     InvalidCoverageCheckPragma r       -> r
     InvalidNoPositivityCheckPragma r   -> r
     InvalidNoUniverseCheckPragma r     -> r
-    InvalidRecordDirective r           -> r
     InvalidTerminationCheckPragma r    -> r
-    MissingDeclarations xs             -> getRange xs
+    MissingDataDeclaration x           -> getRange x
     MissingDefinitions xs              -> getRange xs
     NotAllowedInMutual r x             -> r
-    OpenPublicAbstract r               -> r
-    OpenPublicPrivate r                -> r
+    OpenPublicAbstract kwr             -> getRange kwr
+    OpenPublicPrivate kwr              -> getRange kwr
     PolarityPragmasButNotPostulates xs -> getRange xs
     PragmaCompiled r                   -> r
     PragmaNoTerminationCheck r         -> r
@@ -344,17 +364,16 @@ instance HasRange DeclarationWarning' where
     UnknownFixityInMixfixDecl xs       -> getRange xs
     UnknownNamesInFixityDecl xs        -> getRange xs
     UnknownNamesInPolarityPragmas xs   -> getRange xs
-    UselessAbstract r                  -> r
-    UselessInstance r                  -> r
-    UselessPrivate r                   -> r
+    UselessAbstract kwr                -> getRange kwr
+    UselessInstance kwr                -> getRange kwr
+    UselessMacro kwr                   -> getRange kwr
+    UselessPrivate kwr                 -> getRange kwr
 
 -- These error messages can (should) be terminated by a dot ".",
 -- there is no error context printed after them.
 instance Pretty DeclarationException' where
   pretty (MultipleEllipses p) = fsep $
     pwords "Multiple ellipses in left-hand side" ++ [pretty p]
-  pretty (InvalidName x) = fsep $
-    pwords "Invalid name:" ++ [pretty x]
   pretty (DuplicateDefinition x) = fsep $
     pwords "Duplicate definition of" ++ [pretty x]
   pretty (DuplicateAnonDeclaration _) = fsep $
@@ -380,7 +399,7 @@ instance Pretty DeclarationException' where
     ]
   pretty (WrongContentBlock b _)      = fsep . pwords $
     case b of
-      PostulateBlock -> "A postulate block can only contain type signatures, possibly under keyword instance"
+      PostulateBlock -> "A `postulate` block can only contain type signatures, possibly under keywords `instance` and `private`"
       DataBlock -> "A data definition can only contain type signatures, possibly under keyword instance"
       _ -> "Unexpected declaration"
   pretty (InvalidMeasureMutual _) = fsep $
@@ -389,7 +408,6 @@ instance Pretty DeclarationException' where
     pwords "Missing type signatures for unquoteDef" ++ map pretty (List1.toList xs)
   pretty (BadMacroDef nd) = fsep $
     text (declName nd) : pwords "are not allowed in macro blocks"
-  pretty (DeclarationPanic s) = text s
   pretty (UnfoldingOutsideOpaque _) = fsep . pwords $
     "Unfolding declarations can only appear as the first declaration immediately contained in an opaque block."
   pretty (OpaqueInMutual _) = fsep $
@@ -410,30 +428,32 @@ instance Pretty DeclarationWarning' where
 
     UnknownNamesInFixityDecl xs -> fsep $
       pwords "The following names are not declared in the same scope as their syntax or fixity declaration (i.e., either not in scope at all, imported from another module, or declared in a super module):"
-      ++ punctuate comma (map pretty xs)
+      ++ punctuate comma (fmap pretty $ Set1.toList xs)
 
     UnknownFixityInMixfixDecl xs -> fsep $
       pwords "The following mixfix names do not have an associated fixity declaration:"
-      ++ punctuate comma (map pretty xs)
+      ++ punctuate comma (fmap pretty $ Set1.toList xs)
 
     UnknownNamesInPolarityPragmas xs -> fsep $
       pwords "The following names are not declared in the same scope as their polarity pragmas (they could for instance be out of scope, imported from another module, or declared in a super module):"
-      ++ punctuate comma  (map pretty xs)
+      ++ punctuate comma (fmap pretty $ Set1.toList xs)
 
-    MissingDeclarations xs -> fsep $
-     pwords "The following names are defined but not accompanied by a declaration:"
-     ++ punctuate comma (map (pretty . fst) xs)
+    MissingDataDeclaration x -> fsep $ concat
+      [ pwords "Data definition"
+      , [ pretty x ]
+      , pwords "misses a data declaration"
+      ]
 
     MissingDefinitions xs -> fsep $
      pwords "The following names are declared but not accompanied by a definition:"
-     ++ punctuate comma (map (pretty . fst) xs)
+     ++ punctuate comma (fmap (pretty . fst) xs)
 
     NotAllowedInMutual r nd -> fsep $
       text nd : pwords "in mutual blocks are not supported.  Suggestion: get rid of the mutual block by manually ordering declarations"
 
     PolarityPragmasButNotPostulates xs -> fsep $
       pwords "Polarity pragmas have been given for the following identifiers which are not postulates:"
-      ++ punctuate comma (map pretty xs)
+      ++ punctuate comma (fmap pretty $ Set1.toList xs)
 
     UselessPrivate _ -> fsep $
       pwords "Using private here has no effect. Private applies only to declarations that introduce new identifiers into the module, like type signatures and data, record, and module declarations."
@@ -443,6 +463,9 @@ instance Pretty DeclarationWarning' where
 
     UselessInstance _ -> fsep $
       pwords "Using instance here has no effect. Instance applies only to declarations that introduce new identifiers into the module, like type signatures and axioms."
+
+    UselessMacro _ -> fsep $
+      pwords "Using a macro block here has no effect. `macro' applies only to function definitions."
 
     EmptyMutual    _ -> fsep $ pwords "Empty mutual block."
 
@@ -464,19 +487,15 @@ instance Pretty DeclarationWarning' where
 
     EmptyField _ -> fsep $ pwords "Empty field block."
 
-    HiddenGeneralize _ -> fsep $ pwords "Declaring a variable as hidden has no effect in a variable block. Generalization never introduces visible arguments."
+    EmptyPolarityPragma _ -> fsep $ pwords "POLARITY pragma without polarities (ignored)."
 
-    InvalidRecordDirective{} -> fsep $
-      pwords "Record directives can only be used inside record definitions and before field declarations."
+    HiddenGeneralize _ -> fsep $ pwords "Declaring a variable as hidden has no effect in a variable block. Generalization never introduces visible arguments."
 
     InvalidTerminationCheckPragma _ -> fsep $
       pwords "Termination checking pragmas can only precede a function definition or a mutual block (that contains a function definition)."
 
-    InvalidConstructor{} -> fsep $
-      pwords "`constructor' blocks may only contain type signatures for constructors."
-
     InvalidConstructorBlock{} -> fsep $
-      pwords "No `constructor' blocks outside of `interleaved mutual' blocks."
+      pwords "No `data _ where' blocks outside of `interleaved mutual' blocks."
 
     InvalidCoverageCheckPragma _ -> fsep $
       pwords "Coverage checking pragmas can only precede a function definition or a mutual block (that contains a function definition)."
@@ -518,5 +537,6 @@ instance Pretty DeclarationWarning' where
     where
       unsafePragma s = fsep $ ["Cannot", "use", s] ++ pwords "pragma with safe flag."
 
+instance NFData DeclarationException'
 instance NFData DeclarationWarning
 instance NFData DeclarationWarning'

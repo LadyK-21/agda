@@ -1,8 +1,10 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE CPP #-}
-
-module Agda.Compiler.Common where
+module Agda.Compiler.Common
+  ( module Agda.Compiler.Common
+  , IsMain(..)
+  )
+  where
 
 import Prelude hiding ((!!))
 
@@ -13,9 +15,6 @@ import qualified Data.Set as Set
 import qualified Data.HashMap.Strict as HMap
 import Data.Char
 import Data.Function (on)
-#if __GLASGOW_HASKELL__ < 804
-import Data.Semigroup
-#endif
 
 import Control.Monad
 import Control.Monad.State
@@ -24,7 +23,6 @@ import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
 import Agda.Syntax.TopLevelModuleName
 
-import Agda.Interaction.FindFile ( srcFilePath )
 import Agda.Interaction.Options
 import Agda.Interaction.Imports  ( CheckResult, crInterface, crSource, Source(..) )
 import Agda.Interaction.Library
@@ -39,19 +37,6 @@ import Agda.Utils.Maybe
 import Agda.Utils.WithDefault    ( lensCollapseDefault )
 
 import Agda.Utils.Impossible
-
-data IsMain = IsMain | NotMain
-  deriving (Eq, Show)
-
--- | Conjunctive semigroup ('NotMain' is absorbing).
-instance Semigroup IsMain where
-  NotMain <> _ = NotMain
-  _       <> NotMain = NotMain
-  IsMain  <> IsMain = IsMain
-
-instance Monoid IsMain where
-  mempty = IsMain
-  mappend = (<>)
 
 doCompile :: Monoid r => (IsMain -> Interface -> TCM r) -> IsMain -> Interface -> TCM r
 doCompile f isMain i = do
@@ -154,13 +139,13 @@ inCompilerEnv checkResult cont = do
     -- the current pragma options persistent when we setCommandLineOptions
     -- below.
     opts <- getsTC $ stPersistentOptions . stPersistentState
-    let compileDir = case optCompileDir opts of
-          Just dir -> dir
-          Nothing  ->
-            -- The default output directory is the project root.
-            let tm = iTopLevelModuleName mainI
-                f  = srcFilePath $ srcOrigin checkedSource
-            in filePath $ projectRoot f tm
+    compileDir <- case optCompileDir opts of
+        Just dir -> pure dir
+        Nothing  -> do
+          -- The default output directory is the project root.
+          let tm = iTopLevelModuleName mainI
+          f <- srcFilePath $ srcOrigin checkedSource
+          pure $ filePath $ projectRoot f tm
     setCommandLineOptions $
       opts { optCompileDir = Just compileDir }
 

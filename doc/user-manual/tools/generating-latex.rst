@@ -32,10 +32,12 @@ from :file:`agda.sty`.
 .. note::
 
   The :file:`agda.sty` shipped with Agda is located at
-  :file:`{${AGDA_DIR}}/latex/agda.sty`.  Since version 2.6.2, the
-  :envvar:`AGDA_DIR` is printed by option :option:`--print-agda-dir`.
-  Thus, you can get hold of the CSS file via
-  :samp:`cat $(agda --print-agda-dir)/latex/agda.sty`.
+  :file:`{${Agda_datadir}}/latex/agda. Since version 2.6.2, the Agda
+  data directory can be printed using the option
+  :option:`--print-agda-dir`, which has been an alias of
+  :option:`--print-agda-data-dir` since 2.6.4.1. Thus, you can get hold
+  of the class file via :samp:`cat $(agda
+  --print-agda-data-dir)/latex/agda.sty`.
 
 .. _unicode-latex:
 
@@ -544,7 +546,7 @@ issuing the command
 
 .. code-block:: console
 
-   $ cp $(agda --print-agda-dir)/latex/postprocess-latex.pl .
+   $ cp $(agda --print-agda-data-dir)/latex/postprocess-latex.pl .
 
 In order to generate a PDF, you can then do the following:
 
@@ -824,3 +826,8 @@ code.
 .. _hyperref: https://www.ctan.org/pkg/hyperref
 .. _catchfilebetweentags: https://www.ctan.org/pkg/catchfilebetweentags
 .. _ICU: http://site.icu-project.org/
+
+Generating lagda files directly from Agda using agdaLatex
+---------------------------------------------------------
+A tool for for creating lagda files and corresponding LaTeX files directly from Agda code has been created.
+See  <https://github.com/csetzer/agdaLatex>

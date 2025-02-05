@@ -3,12 +3,12 @@
 module AllStdLib where
 
 -- Ensure that the entire standard library is compiled.
-import README
+import Everything
 
 open import Data.Unit.Polymorphic using (⊤)
 open import Data.String
 open import IO using (putStrLn; run)
-open import IO.Primitive using (IO; _>>=_)
+open import IO.Primitive.Core using (IO; _>>=_)
 
 import DivMod
 import HelloWorld

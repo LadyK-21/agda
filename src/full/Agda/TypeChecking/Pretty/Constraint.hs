@@ -37,6 +37,7 @@ prettyConstraint c = f (locallyTCState stInstantiateBlocking (const True) $ pret
     f d = if null $ P.pretty r
           then d
           else d $$ nest 4 ("[ at" <+> prettyTCM r <+> "]")
+{-# SPECIALIZE prettyConstraint :: ProblemConstraint -> TCM Doc #-}
 
 interestingConstraint :: ProblemConstraint -> Bool
 interestingConstraint pc = go $ clValue (theConstraint pc) where
@@ -50,11 +51,10 @@ prettyInterestingConstraints cs = mapM (prettyConstraint . stripPids) $ List.sor
     cs' = filter interestingConstraint cs
     interestingPids = Set.unions $ map (allBlockingProblems . constraintUnblocker) cs'
     stripPids (PConstr pids unblock c) = PConstr (Set.intersection pids interestingPids) unblock c
-
+{-# SPECIALIZE prettyInterestingConstraints :: [ProblemConstraint] -> TCM [Doc] #-}
 
 prettyRangeConstraint ::
-  (MonadPretty m, Foldable f, Null (f ProblemId)) =>
-  Range -> f ProblemId -> Blocker -> Doc -> m Doc
+  (MonadPretty m, Foldable f, Null (f ProblemId)) => Range -> f ProblemId -> Blocker -> Doc -> m Doc
 prettyRangeConstraint r pids unblock c =
   return c <?>
   sep [ prange r
@@ -100,8 +100,7 @@ instance PrettyTCM Constraint where
               BlockedConst t -> prettyCmp ":=" m t
               PostponedTypeCheckingProblem cl -> enterClosure cl $ \p ->
                 prettyCmp ":=" m p
-              Open{}  -> __IMPOSSIBLE__
-              OpenInstance{} -> __IMPOSSIBLE__
+              OpenMeta{}  -> __IMPOSSIBLE__
               InstV{} -> empty
               -- Andreas, 2017-01-11, issue #2637:
               -- The size solver instantiates some metas with infinity
@@ -114,25 +113,35 @@ instance PrettyTCM Constraint where
               --     , show m ++ show args ++ " := " ++ show t
               --     ]
               --   __IMPOSSIBLE__
+
         FindInstance m mcands -> do
-            t <- getMetaTypeInContext m
-            TelV tel _ <- telViewUpTo' (-1) notVisible t
-            sep [ "Resolve instance argument" <?> prettyCmp ":" m t
-                  -- #4071: Non-visible arguments to the meta are in scope of the candidates add
-                  --        those here to not get out of scope deBruijn indices when printing
-                  --        unsolved constraints.
-                , addContext tel cands
-                ]
+          t <- getMetaTypeInContext m
+          TelV tel _ <- telViewUpTo' (-1) notVisible t
+          sep [ "Resolve instance argument" <?> prettyCmp ":" m t
+                -- #4071: Non-visible arguments to the meta are in scope of the candidates add
+                --        those here to not get out of scope deBruijn indices when printing
+                --        unsolved constraints.
+              , addContext tel cands
+              ]
           where
-            cands =
-              case mcands of
-                Nothing -> "No candidates yet"
-                Just cnds ->
-                  hang "Candidates" 2 $ vcat
-                    [ hang (overlap c <+> prettyTCM c <+> ":") 2 $
-                            prettyTCM (candidateType c) | c <- cnds ]
-              where overlap c | candidateOverlappable c = "overlap"
-                              | otherwise               = empty
+            overlap c = case candidateOverlap c of
+              FieldOverlap   -> "overlap"
+              Incoherent     -> "[incoherent]"
+              Overlappable   -> "[overlappable]"
+              Overlapping    -> "[overlapping]"
+              Overlaps       -> "[overlaps]"
+              DefaultOverlap -> empty
+
+            cands = case mcands of
+              Nothing -> "No candidates yet"
+              Just cnds -> hang "Candidates" 2 $ vcat
+                [ hang (overlap c <+> prettyTCM c <+> ":") 2 $
+                    prettyTCM (candidateType c)
+                | c <- cnds
+                ]
+
+        ResolveInstanceHead q ->
+            "Resolve target type of instance: " <?> prettyTCM q
         IsEmpty r t ->
             "Is empty:" <?> prettyTCMCtx TopCtx t
         CheckSizeLtSat t ->

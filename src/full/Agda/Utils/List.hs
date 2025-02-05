@@ -2,7 +2,13 @@
 
 -- | Utility functions for lists.
 
-module Agda.Utils.List where
+module Agda.Utils.List (module Agda.Utils.List, module X) where
+
+-- Reexports
+
+import Data.List as X (uncons)
+
+-- Regular imports
 
 import Control.Monad (filterM)
 
@@ -11,6 +17,7 @@ import qualified Data.Array as Array
 import Data.Bifunctor
 import Data.Function (on)
 import Data.Hashable
+import Data.List.Split (splitOn)
 import qualified Data.List as List
 import qualified Data.List.NonEmpty as List1
 import Data.List.NonEmpty (pattern (:|), (<|))
@@ -18,6 +25,7 @@ import Data.Maybe
 import qualified Data.Map as Map
 import qualified Data.HashMap.Strict as HMap
 import qualified Data.Set as Set
+import Data.Strict.These
 
 import qualified Agda.Utils.Bag as Bag
 import Agda.Utils.CallStack.Base
@@ -26,7 +34,6 @@ import Agda.Utils.Functor  ((<.>))
 import Agda.Utils.Tuple
 
 import {-# SOURCE #-} Agda.Utils.List1 (List1)
-import {-# SOURCE #-} qualified Agda.Utils.List1 as List1 (groupOn)
 
 import Agda.Utils.Impossible
 
@@ -81,8 +88,9 @@ tailWithDefault def = fromMaybe def . tailMaybe
 -- | Last element (safe).
 --   O(n).
 lastMaybe :: [a] -> Maybe a
-lastMaybe [] = Nothing
-lastMaybe xs = Just $ last xs
+lastMaybe = \case
+  []   -> Nothing
+  x:xs -> Just $ last1 x xs
 
 -- | Last element (safe).  Returns a default list on empty lists.
 --   O(n).
@@ -111,12 +119,6 @@ last2' :: a -> a -> [a] -> (a, a)
 last2' x y = \case
   []  -> (x, y)
   z:zs -> last2' y z zs
-
--- | Opposite of cons @(:)@, safe.
---   O(1).
-uncons :: [a] -> Maybe (a, [a])
-uncons []     = Nothing
-uncons (x:xs) = Just (x,xs)
 
 -- | Maybe cons.
 --   O(1).
@@ -360,9 +362,19 @@ mapMaybeAndRest f = loop [] where
     x:xs | Just y <- f x -> first (y:) $ loop [] xs
          | otherwise     -> loop (x:acc) xs
 
--- | Sublist relation.
-isSublistOf :: Eq a => [a] -> [a] -> Bool
-isSublistOf = List.isSubsequenceOf
+-- | @dropFrom marker xs@ drops everything from @xs@
+-- starting with (and including) @marker@.
+--
+-- If the marker does not appear, the string is returned unchanged.
+--
+-- The following two properties hold provided @marker@ has no overlap with @xs@:
+--
+-- @
+--   dropFrom marker (xs ++ marker ++ ys) == xs
+--   dropFrom marker xs == xs
+-- @
+dropFrom :: Eq a => List1 a -> [a] -> [a]
+dropFrom marker xs = headWithDefault __IMPOSSIBLE__ $ splitOn (List1.toList marker) xs
 
 -- | All ways of removing one element from a list.
 --   O(n²).
@@ -493,27 +505,8 @@ findOverlap xs ys =
     | otherwise                = Nothing
 
 ---------------------------------------------------------------------------
--- * Groups and chunks
+-- * Chunks
 ---------------------------------------------------------------------------
-
--- | @'groupOn' f = 'groupBy' (('==') \`on\` f) '.' 'List.sortBy' ('compare' \`on\` f)@.
--- O(n log n).
-groupOn :: Ord b => (a -> b) -> [a] -> [[a]]
-groupOn f = map List1.toList . List1.groupOn f
-
--- | A variant of 'List.groupBy' which applies the predicate to consecutive
--- pairs.
--- O(n).
--- DEPRECATED in favor of 'Agda.Utils.List1.groupBy''.
-groupBy' :: (a -> a -> Bool) -> [a] -> [[a]]
-groupBy' _ []           = []
-groupBy' p xxs@(x : xs) = grp x $ zipWith (\x y -> (p x y, y)) xxs xs
-  where
-  grp x ys = (x : map snd xs) : tail
-    where (xs, rest) = span fst ys
-          tail = case rest of
-                   []            -> []
-                   ((_, z) : zs) -> grp z zs
 
 -- | Chop up a list in chunks of a given length.
 -- O(n).
@@ -590,8 +583,8 @@ fastDistinct xs = Set.size (Set.fromList xs) == length xs
 duplicates :: Ord a => [a] -> [a]
 duplicates = mapMaybe dup . Bag.groups . Bag.fromList
   where
-    dup (a : _ : _) = Just a
-    dup _           = Nothing
+    dup (a :| _ : _) = Just a
+    dup _            = Nothing
 
 -- | Remove the first representative for each list element.
 --   Thus, returns all duplicate copies.
@@ -599,7 +592,7 @@ duplicates = mapMaybe dup . Bag.groups . Bag.fromList
 --
 --   @allDuplicates xs == sort $ xs \\ nub xs@.
 allDuplicates :: Ord a => [a] -> [a]
-allDuplicates = concatMap (drop 1 . reverse) . Bag.groups . Bag.fromList
+allDuplicates = concatMap (List1.tail . List1.reverse) . Bag.groups . Bag.fromList
   -- The reverse is necessary to actually remove the *first* occurrence
   -- of each element.
 
@@ -758,6 +751,11 @@ zipWithKeepRest f = loop
 -- zipWithTails f (x : xs) (y : ys) = (f x y : zs , as , bs)
 --   where (zs , as , bs) = zipWithTails f xs ys
 
+-- | Analogous to zip, combines two lists by taking the union using These (strict).
+align :: [a] -> [b] -> [These a b]
+align xs [] = This <$> xs
+align [] ys = That <$> ys
+align (x:xs) (y:ys) = These x y : align xs ys
 
 ---------------------------------------------------------------------------
 -- * Unzipping
@@ -803,12 +801,12 @@ editDistance xs ys = editD 0 0
       -- Corner (EQ, EQ): both lists are empty
       _             -> 0
       -- GT cases are impossible.
-    where (i',j') = (i+1, j+1)
+    where (i', j') = (i + 1, j + 1)
   n   = length xs
   m   = length ys
   xsA, ysA :: Array Int a
-  xsA = listArray (0,n-1) xs
-  ysA = listArray (0,m-1) ys
+  xsA = listArray (0, n - 1) xs
+  ysA = listArray (0, m - 1) ys
 
 
 mergeStrictlyOrderedBy :: (a -> a -> Bool) -> [a] -> [a] -> Maybe [a]

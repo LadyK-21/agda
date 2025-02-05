@@ -1,18 +1,14 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE GADTs #-}
 
 module Agda.TypeChecking.MetaVars where
 
 import Prelude hiding (null)
 
-import Control.Monad        ( foldM, forM, forM_, liftM2, void, guard )
 import Control.Monad.Except ( MonadError(..), ExceptT, runExceptT )
-import Control.Monad.Trans  ( lift )
 import Control.Monad.Trans.Maybe
 
-import Data.Function (on)
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
 import qualified Data.List as List
@@ -25,10 +21,12 @@ import Agda.Interaction.Options
 
 import Agda.Syntax.Abstract.Name as A
 import Agda.Syntax.Common
+import Agda.Syntax.Info ( MetaKind( InstanceMeta, UnificationMeta ), MetaNameSuggestion)
+import qualified Agda.Syntax.Info as A
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.Generic
 import Agda.Syntax.Internal.MetaVars
-import Agda.Syntax.Position (getRange)
+import Agda.Syntax.Position (getRange, killRange)
 
 import Agda.TypeChecking.Monad
 -- import Agda.TypeChecking.Monad.Builtin
@@ -57,6 +55,8 @@ import qualified Agda.Utils.BiMap as BiMap
 import Agda.Utils.Function
 import Agda.Utils.Lens
 import Agda.Utils.List
+import Agda.Utils.List1 (List1, pattern (:|))
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Size
@@ -110,18 +110,17 @@ isBlockedTerm x = do
             BlockedConst{}                 -> True
             PostponedTypeCheckingProblem{} -> True
             InstV{}                        -> False
-            Open{}                         -> False
-            OpenInstance{}                 -> False
+            OpenMeta{}                     -> False
     reportSLn "tc.meta.blocked" 12 $
       if r then "  yes, because " ++ prettyShow i else "  no"
     return r
 
-isEtaExpandable :: [MetaKind] -> MetaId -> TCM Bool
-isEtaExpandable kinds x = do
+isEtaExpandable :: [MetaClass] -> MetaId -> TCM Bool
+isEtaExpandable classes x = do
     i <- lookupMetaInstantiation x
     return $ case i of
-      Open{}                         -> True
-      OpenInstance{}                 -> Records `notElem` kinds
+      OpenMeta UnificationMeta       -> True
+      OpenMeta InstanceMeta          -> Records `notElem` classes
       InstV{}                        -> False
       BlockedConst{}                 -> False
       PostponedTypeCheckingProblem{} -> False
@@ -174,6 +173,7 @@ newSortMetaBelowInf = do
   hasBiggerSort x
   return x
 
+{-# SPECIALIZE newSortMeta :: TCM Sort #-}
 -- | Create a sort meta that may be instantiated with 'Inf' (Setω).
 newSortMeta :: MonadMetaSolver m => m Sort
 newSortMeta =
@@ -210,6 +210,7 @@ newTypeMeta_  = newTypeMeta' CmpEq =<< (workOnTypes $ newSortMeta)
 -- that it has a sort.  The sort comes from the solution.
 -- newTypeMeta_  = newTypeMeta Inf
 
+{-# SPECIALIZE newLevelMeta :: TCM Level #-}
 newLevelMeta :: MonadMetaSolver m => m Level
 newLevelMeta = do
   (x, v) <- newValueMeta RunMetaOccursCheck CmpEq =<< levelType
@@ -217,6 +218,7 @@ newLevelMeta = do
     Level l    -> l
     _          -> atomicLevel v
 
+{-# SPECIALIZE newInstanceMeta :: MetaNameSuggestion -> Type -> TCM (MetaId, Term) #-}
 -- | @newInstanceMeta s t cands@ creates a new instance metavariable
 --   of type the output type of @t@ with name suggestion @s@.
 newInstanceMeta
@@ -240,7 +242,7 @@ newInstanceMetaCtx s t vs = do
   let i = i0 { miNameSuggestion = s }
   TelV tel _ <- telView t
   let perm = idP (size tel)
-  x <- newMeta' OpenInstance Instantiable i normalMetaPriority perm (HasType () CmpLeq t)
+  x <- newMeta' (OpenMeta InstanceMeta) Instantiable i normalMetaPriority perm (HasType () CmpLeq t)
   reportSDoc "tc.meta.new" 50 $ fsep
     [ nest 2 $ pretty x <+> ":" <+> prettyTCM t
     ]
@@ -263,6 +265,18 @@ newNamedValueMeta' b s cmp t = do
   setMetaNameSuggestion x s
   return (x, v)
 
+{-# SPECIALIZE newValueMetaOfKind :: A.MetaInfo -> RunMetaOccursCheck -> Comparison -> Type -> TCM (MetaId, Term) #-}
+newValueMetaOfKind :: MonadMetaSolver m
+  => A.MetaInfo
+  -> RunMetaOccursCheck  -- ^ Ignored for instance metas.
+  -> Comparison          -- ^ Ignored for instance metas.
+  -> Type
+  -> m (MetaId, Term)
+newValueMetaOfKind info = case A.metaKind info of
+  UnificationMeta -> newValueMeta
+  InstanceMeta -> \ _run _cmp -> newInstanceMeta (A.metaNameSuggestion info)
+
+{-# SPECIALIZE newValueMeta :: RunMetaOccursCheck -> Comparison -> Type -> TCM (MetaId, Term) #-}
 -- | Create a new metavariable, possibly η-expanding in the process.
 newValueMeta :: MonadMetaSolver m => RunMetaOccursCheck -> Comparison -> Type -> m (MetaId, Term)
 newValueMeta b cmp t = do
@@ -276,6 +290,7 @@ newValueMetaCtx
 newValueMetaCtx frozen b cmp t tel perm ctx =
   mapSndM instantiateFull =<< newValueMetaCtx' frozen b cmp t tel perm ctx
 
+{-# SPECIALIZE newValueMeta' :: RunMetaOccursCheck -> Comparison -> Type -> TCM (MetaId, Term) #-}
 -- | Create a new value meta without η-expanding.
 newValueMeta'
   :: MonadMetaSolver m
@@ -312,9 +327,11 @@ type Condition = Dom Type -> Abs Type -> Bool
 trueCondition :: Condition
 trueCondition _ _ = True
 
+{-# SPECIALIZE newArgsMeta :: Type -> TCM Args #-}
 newArgsMeta :: MonadMetaSolver m => Type -> m Args
 newArgsMeta = newArgsMeta' trueCondition
 
+{-# SPECIALIZE newArgsMeta' :: Condition -> Type -> TCM Args #-}
 newArgsMeta' :: MonadMetaSolver m => Condition -> Type -> m Args
 newArgsMeta' condition t = do
   args <- getContextArgs
@@ -373,10 +390,12 @@ newRecordMetaCtx
   -> Args    -- ^ Parameters of record type.
   -> Telescope -> Permutation -> Args -> TCM Term
 newRecordMetaCtx pref frozen r pars tel perm ctx = do
-  ftel   <- flip apply pars <$> getRecordFieldTypes r
+  rdef   <- getRecordDef r
+  let con = killRange $ _recConHead rdef
+  -- Get the record field types as telescope.
+  let ftel = apply (_recTel rdef) pars
   fields <- newArgsMetaCtx'' pref frozen trueCondition
               (telePi_ ftel __DUMMY_TYPE__) tel perm ctx
-  con    <- getRecordConstructor r
   return $ Con con ConOSystem (map Apply fields)
 
 newQuestionMark :: InteractionId -> Comparison -> Type -> TCM (MetaId, Term)
@@ -420,10 +439,10 @@ newQuestionMark' new ii cmp t = lookupInteractionMeta ii >>= \case
     -- we base our decisions on the names of the context entries.
     -- Ideally, Agda would organize contexts in ancestry trees
     -- with substitutions to move between parent and child.
-    let glen = length gamma
-    let dlen = length delta
-    let gxs  = map (fst . unDom) gamma
-    let dxs  = map (fst . unDom) delta
+    let gxs  = contextNames' gamma
+    let dxs  = contextNames' delta
+    let glen = length gxs
+    let dlen = length dxs
     reportSDoc "tc.interaction" 20 $ vcat
       [ "reusing meta"
       , nest 2 $ "creation context:" <+> pretty gxs
@@ -496,7 +515,7 @@ newQuestionMark' new ii cmp t = lookupInteractionMeta ii >>= \case
         let numFields = glen - g1len - g0len
         if numFields <= 0 then return $ vs1 ++ vs0 else do
           -- Get the record type.
-          let t = snd . unDom . fromMaybe __IMPOSSIBLE__ $ delta !!! k
+          let t = (unDom . ctxEntryDom) $ fromMaybe __IMPOSSIBLE__ $ delta !!! k
           -- Get the record field names.
           fs <- getRecordTypeFields t
           -- Field arguments to the original meta are projections from the record var.
@@ -505,13 +524,14 @@ newQuestionMark' new ii cmp t = lookupInteractionMeta ii >>= \case
           return $ vs1 ++ reverse (take numFields vfs) ++ vs0
 
     -- Use ArgInfo from Γ.
-    let args = reverse $ zipWith (<$) rev_args $ map argFromDom gamma
+    let args = zipWith (<$) (reverse rev_args) $ contextArgs gamma
     -- Take the permutation into account (see TC.Monad.MetaVars.getMetaContextArgs).
     let vs = permute (takeP (length args) p) args
     reportSDoc "tc.interaction" 20 $ vcat
       [ "meta reuse arguments:" <+> prettyTCM vs ]
     return (x, MetaV x $ map Apply vs)
 
+{-# SPECIALIZE blockTerm :: Type -> TCM Term -> TCM Term #-}
 -- | Construct a blocked constant if there are constraints.
 blockTerm
   :: (MonadMetaSolver m, MonadConstraint m, MonadFresh Nat m, MonadFresh ProblemId m)
@@ -520,6 +540,7 @@ blockTerm t blocker = do
   (pid, v) <- newProblem blocker
   blockTermOnProblem t v pid
 
+{-# SPECIALIZE blockTermOnProblem :: Type -> Term -> ProblemId -> TCM Term #-}
 blockTermOnProblem
   :: (MonadMetaSolver m, MonadFresh Nat m)
   => Type -> Term -> ProblemId -> m Term
@@ -568,6 +589,7 @@ blockTermOnProblem t v pid = do
         listenToMeta (CheckConstraint i cmp) x
         return v
 
+{-# SPECIALIZE blockTypeOnProblem :: Type -> ProblemId -> TCM Type #-}
 blockTypeOnProblem
   :: (MonadMetaSolver m, MonadFresh Nat m)
   => Type -> ProblemId -> m Type
@@ -587,7 +609,7 @@ postponeTypeCheckingProblem_ p = do
   where
     unblock (CheckExpr _ _ t)         = unblockedTester t
     unblock (CheckArgs _ _ _ _ t _ _) = unblockedTester t  -- The type of the head of the application.
-    unblock (CheckProjAppToKnownPrincipalArg _ _ _ _ _ _ _ _ t _) = unblockedTester t -- The type of the principal argument
+    unblock (CheckProjAppToKnownPrincipalArg _ _ _ _ _ _ _ _ _ t _) = unblockedTester t -- The type of the principal argument
     unblock (CheckLambda _ _ _ t)     = unblockedTester t
     unblock (DoQuoteTerm _ _ _)       = __IMPOSSIBLE__     -- also quoteTerm problems
 
@@ -632,13 +654,13 @@ postponeTypeCheckingProblem p unblock = do
 problemType :: TypeCheckingProblem -> Type
 problemType (CheckExpr _ _ t         ) = t
 problemType (CheckArgs _ _ _ _ _ t _ ) = t  -- The target type of the application.
-problemType (CheckProjAppToKnownPrincipalArg _ _ _ _ _ t _ _ _ _) = t -- The target type of the application
+problemType (CheckProjAppToKnownPrincipalArg _ _ _ _ _ _ t _ _ _ _) = t -- The target type of the application
 problemType (CheckLambda _ _ _ t     ) = t
 problemType (DoQuoteTerm _ _ t)        = t
 
 -- | Eta-expand a local meta-variable, if it is of the specified kind.
 --   Don't do anything if the meta-variable is a blocked term.
-etaExpandMetaTCM :: [MetaKind] -> MetaId -> TCM ()
+etaExpandMetaTCM :: [MetaClass] -> MetaId -> TCM ()
 etaExpandMetaTCM kinds m = whenM ((not <$> isFrozen m) `and2M` asksTC envAssignMetas `and2M` isEtaExpandable kinds m) $ do
   verboseBracket "tc.meta.eta" 20 ("etaExpandMeta " ++ prettyShow m) $ do
     let waitFor b = do
@@ -737,6 +759,7 @@ etaExpandBlocked (Blocked b t)  = do
     Blocked b' _ | b /= b' -> etaExpandBlocked t
     _                      -> return t
 
+{-# SPECIALIZE assignWrapper :: CompareDirection -> MetaId -> Elims -> Term -> TCM () -> TCM () #-}
 assignWrapper :: (MonadMetaSolver m, MonadConstraint m, MonadError TCErr m, MonadDebug m, HasOptions m)
               => CompareDirection -> MetaId -> Elims -> Term -> m () -> m ()
 assignWrapper dir x es v doAssign = do
@@ -797,7 +820,7 @@ assign dir x args v target = addOrUnblocker (unblockOnMeta x) $ do
 
   let
     boundary v = do
-      cubical <- optCubical <$> pragmaOptions
+      cubical <- cubicalOption
       isip <- isInteractionMetaB x args
       case (,) <$> cubical <*> isip of
         Just (_, (x, ip, args)) -> tryAddBoundary dir x ip args v target
@@ -945,10 +968,10 @@ assign dir x args v target = addOrUnblocker (unblockOnMeta x) $ do
       -- even though the lhs is not a pattern, we can prune the y from _2
 
       let
-                vars        = freeVars args
-                relVL       = filterVarMapToList isRelevant  vars
-                nonstrictVL = filterVarMapToList isNonStrict vars
-                irrVL       = filterVarMapToList (liftM2 (&&) isIrrelevant isUnguarded) vars
+                vars              = freeVars args
+                relevantVL        = filterVarMapToList isRelevant vars
+                shapeIrrelevantVL = filterVarMapToList isShapeIrrelevant vars
+                irrelevantVL      = filterVarMapToList (liftM2 (&&) isIrrelevant isUnguarded) vars
             -- Andreas, 2011-10-06 only irrelevant vars that are direct
             -- arguments to the meta, hence, can be abstracted over, may
             -- appear on the rhs.  (test/fail/Issue483b)
@@ -971,9 +994,9 @@ assign dir x args v target = addOrUnblocker (unblockOnMeta x) $ do
               pr _          = ".."
           in vcat
                [ "mvar args:" <+> sep (map (pr . unArg) args)
-               , "fvars lhs (rel):" <+> sep (map (text . show) relVL)
-               , "fvars lhs (nonstrict):" <+> sep (map (text . show) nonstrictVL)
-               , "fvars lhs (irr):" <+> sep (map (text . show) irrVL)
+               , "fvars lhs (relevant)        :" <+> sep (map (text . show) relevantVL)
+               , "fvars lhs (shape-irrelevant):" <+> sep (map (text . show) shapeIrrelevantVL)
+               , "fvars lhs (irrelevant)      :" <+> sep (map (text . show) irrelevantVL)
                ]
 
       -- Check that the x doesn't occur in the right hand side.
@@ -981,7 +1004,7 @@ assign dir x args v target = addOrUnblocker (unblockOnMeta x) $ do
       -- Herein, distinguish relevant and irrelevant vars,
       -- since when abstracting irrelevant lhs vars, they may only occur
       -- irrelevantly on rhs.
-      -- v <- liftTCM $ occursCheck x (relVL, nonstrictVL, irrVL) v
+      -- v <- liftTCM $ occursCheck x (relevantVL, nonstrictVL, irrelevantVL) v
       v <- liftTCM $ occursCheck x vars v
 
       reportSLn "tc.meta.assign" 15 "passed occursCheck"
@@ -1050,16 +1073,15 @@ assign dir x args v target = addOrUnblocker (unblockOnMeta x) $ do
             let earlierThan l j = j > l
             TelV tel' _ <- telViewUpToPath (length args) t
             forM_ ids $ \(i,u) -> do
-              d <- lookupBV i
+              d <- domOfBV i
               case getLock (getArgInfo d) of
                 IsNotLock -> pure ()
                 IsLock{} -> do
                 let us = IntSet.unions $ map snd $ filter (earlierThan i . fst) idvars
                 -- us Earlier than u
-                addContext tel' $ checkEarlierThan u us
-                  `catchError` \case
-                     TypeError{} -> patternViolation (unblockOnMeta x) -- If the earlier check hard-fails we need to
-                     err         -> throwError err                     -- solve this meta in some other way.
+                unlessM (addContext tel' $ checkEarlierThan u us) $
+                  patternViolation (unblockOnMeta x)  -- If the earlier check hard-fails we need to
+                                                      -- solve this meta in some other way.
 
           let n = length args
           TelV tel' _ <- telViewUpToPath n t
@@ -1278,8 +1300,8 @@ assignMeta' m x t n ids v = do
   -- ALT 2: O(m)
   let assocToList i = \case
         _           | i >= m -> []
-        ((j,u) : l) | i == j -> Just u  : assocToList (i+1) l
-        l                    -> Nothing : assocToList (i+1) l
+        ((j,u) : l) | i == j -> Just u  : assocToList (i + 1) l
+        l                    -> Nothing : assocToList (i + 1) l
       ivs = assocToList 0 ids
       rho = prependS impossible ivs $ raiseS n
       v'  = applySubst rho v
@@ -1341,8 +1363,7 @@ checkMetaInst x = do
   case mvInstantiation m of
     BlockedConst{} -> postpone
     PostponedTypeCheckingProblem{} -> postpone
-    Open{} -> postpone
-    OpenInstance{} -> postpone
+    OpenMeta{} -> postpone
     InstV inst -> do
       let n = size (instTel inst)
           t = jMetaType $ mvJudgement m
@@ -1392,6 +1413,7 @@ checkSubtypeIsEqual a b = do
           | getRelevance a1 /= getRelevance b1 -> patternViolation neverUnblock -- Can we recover from this?
           | getQuantity  a1 /= getQuantity  b1 -> patternViolation neverUnblock
           | getCohesion  a1 /= getCohesion  b1 -> patternViolation neverUnblock
+          | getModalPolarity a1 /= getModalPolarity b1 -> patternViolation neverUnblock
           | otherwise -> do
               checkSubtypeIsEqual (unDom b1) (unDom a1)
               underAbstractionAbs a1 a2 $ \a2' -> checkSubtypeIsEqual a2' (absBody b2)
@@ -1521,10 +1543,14 @@ instance ReduceAndEtaContract a => ReduceAndEtaContract (Arg a)
 
 instance ReduceAndEtaContract Term where
   reduceAndEtaContract u = do
-    reduce u >>= \case
+    reportSDoc "tc.meta" 30 $ "trying to eta-contract u =" <+> prettyTCM u
+    u <- reduce u
+    reportSDoc "tc.meta" 30 $ "               reduced u =" <+> prettyTCM u
+    case u of
       -- In case of lambda or record constructor, it makes sense to
       -- reduce further.
-      Lam ai (Abs x b) -> etaLam ai x =<< reduceAndEtaContract b
+      Lam ai bAbs -> underAbstraction_ bAbs $ \b ->
+        etaLam ai (absName bAbs) =<< reduceAndEtaContract b
       Con c ci es -> etaCon c ci es $ \ r c ci args -> do
         args <- reduceAndEtaContract args
         etaContractRecord r c ci args
@@ -1588,19 +1614,17 @@ type SubstCand = [(Int,Term)] -- ^ a possibly non-deterministic substitution
 -- | Turn non-det substitution into proper substitution, if possible.
 --   Otherwise, raise the error.
 checkLinearity :: SubstCand -> ExceptT () TCM SubstCand
-checkLinearity ids0 = do
-  let ids = List.sortBy (compare `on` fst) ids0  -- see issue 920
-  let grps = groupOn fst ids
-  concat <$> mapM makeLinear grps
+checkLinearity ids = do
+  -- see issue #920
+  List1.toList <$> mapM makeLinear (List1.groupOn fst ids)
   where
     -- Non-determinism can be healed if type is singleton. [Issue 593]
     -- (Same as for irrelevance.)
-    makeLinear :: SubstCand -> ExceptT () TCM SubstCand
-    makeLinear []            = __IMPOSSIBLE__
-    makeLinear grp@[_]       = return grp
-    makeLinear (p@(i,t) : _) =
+    makeLinear :: List1 (Int, Term) -> ExceptT () TCM (Int, Term)
+    makeLinear (p       :| []) = return p
+    makeLinear (p@(i,t) :| _ ) =
       ifM ((Right True ==) <$> do lift . runBlocked . isSingletonTypeModuloRelevance =<< typeOfBV i)
-        (return [p])
+        (return p)
         (throwError ())
 
 -- Intermediate result in the following function
@@ -1657,10 +1681,10 @@ inverseSubst' skip args = map (mapFst unArg) <$> loop (zip args terms)
              | skip tm           = return vars
              | otherwise         = failure tm
         irrProj <- optIrrelevantProjections <$> pragmaOptions
-        lift (isRecordConstructor $ conName c) >>= \case
-          Just (_, r@Record{ recFields = fs })
-            | YesEta <- recEtaEquality r  -- Andreas, 2019-11-10, issue #4185: only for eta-records
-            , length fs == length es
+        lift (isEtaRecordConstructor $ conName c) >>= \case
+          -- Andreas, 2019-11-10, issue #4185: only for eta-records
+          Just (_, RecordData{ _recFields = fs })
+            | length fs == length es
             , hasQuantity0 info || all usableQuantity fs     -- Andreas, 2019-11-12/17, issue #4168b
             , irrProj || all isRelevant fs -> do
               let aux (Arg _ v) Dom{domInfo = info', unDom = f} =
@@ -1672,6 +1696,7 @@ inverseSubst' skip args = map (mapFst unArg) <$> loop (zip args terms)
                         { modRelevance  = max (getRelevance info) (getRelevance info')
                         , modQuantity   = max (getQuantity  info) (getQuantity  info')
                         , modCohesion   = max (getCohesion  info) (getCohesion  info')
+                        , modPolarity   = addPolarity (getModalPolarity info) (getModalPolarity info') -- XXX
                         }
                       , argInfoOrigin   = min (getOrigin info) (getOrigin info')
                       , argInfoFreeVariables = unknownFreeVariables
@@ -1712,7 +1737,7 @@ inverseSubst' skip args = map (mapFst unArg) <$> loop (zip args terms)
   -- adding an irrelevant entry only if not present
   cons :: (Arg Nat, Term) -> Res -> Res
   cons a@(Arg ai i, t) vars
-    | isIrrelevant ai = applyUnless (any ((i==) . unArg . fst) vars) (a :) vars
+    | isIrrelevant ai = applyUnless (any ((i ==) . unArg . fst) vars) (a :) vars
     | otherwise       = a :  -- adding a relevant entry
         -- filter out duplicate irrelevants
         filter (not . (\ a@(Arg info j, t) -> isIrrelevant info && i == j)) vars
@@ -1773,8 +1798,8 @@ isFaceConstraint mid args = runMaybeT $ do
   let
     assocToList i = \case
       _           | i >= m -> []
-      ((j,u) : l) | i == j -> Just u  : assocToList (i+1) l
-      l                    -> Nothing : assocToList (i+1) l
+      ((j,u) : l) | i == j -> Just u  : assocToList (i + 1) l
+      l                    -> Nothing : assocToList (i + 1) l
     ivs = assocToList 0 ids
     rho = prependS impossible ivs $ raiseS n
 
@@ -1889,7 +1914,7 @@ openMetasToPostulates = do
       ]
 
     -- Add the new postulate to the signature.
-    addConstant' q defaultArgInfo q t defaultAxiom
+    addConstant' q defaultArgInfo t defaultAxiom
 
     -- Solve the meta.
     let inst = InstV $ Instantiation

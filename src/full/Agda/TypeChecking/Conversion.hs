@@ -8,10 +8,7 @@
 module Agda.TypeChecking.Conversion where
 
 import Control.Arrow (second)
-import Control.Monad
-import Control.Monad.Except
--- Control.Monad.Fail import is redundant since GHC 8.8.1
-import Control.Monad.Fail (MonadFail)
+import Control.Monad.Except ( MonadError(..) )
 
 import Data.Function (on)
 import Data.Semigroup ((<>))
@@ -54,6 +51,7 @@ import Agda.TypeChecking.Warnings (MonadWarning)
 import Agda.Interaction.Options
 
 import Agda.Utils.Functor
+import Agda.Utils.Lens
 import Agda.Utils.List1 (List1, pattern (:|))
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Monad
@@ -78,7 +76,6 @@ type MonadConversion m =
   , MonadStatistics m
   , MonadFresh ProblemId m
   , MonadFresh Int m
-  , MonadFail m
   )
 
 -- | Try whether a computation runs without errors or new constraints
@@ -125,12 +122,15 @@ guardPointerEquality u v profileSection action =
   then whenProfile Profile.Conversion $ tick profileSection
   else action
 
+{-# SPECIALIZE equalTerm :: Type -> Term -> Term -> TCM () #-}
 equalTerm :: MonadConversion m => Type -> Term -> Term -> m ()
 equalTerm = compareTerm CmpEq
 
+{-# SPECIALIZE equalAtom :: CompareAs -> Term -> Term -> TCM () #-}
 equalAtom :: MonadConversion m => CompareAs -> Term -> Term -> m ()
 equalAtom = compareAtom CmpEq
 
+{-# SPECIALIZE equalType :: Type -> Type -> TCM () #-}
 equalType :: MonadConversion m => Type -> Type -> m ()
 equalType = compareType CmpEq
 
@@ -145,15 +145,18 @@ equalType = compareType CmpEq
 -- | Ignore errors in irrelevant context.
 convError :: TypeError -> TCM ()
 convError err =
-  ifM ((==) Irrelevant <$> viewTC eRelevance)
+  ifM (isIrrelevant <$> viewTC eRelevance)
     (return ())
     (typeError err)
+
 
 -- | Type directed equality on values.
 --
 compareTerm :: forall m. MonadConversion m => Comparison -> Type -> Term -> Term -> m ()
 compareTerm cmp a u v = compareAs cmp (AsTermsOf a) u v
 
+
+{-# SPECIALIZE compareAs :: Comparison -> CompareAs -> Term -> Term -> TCM ()  #-}
 -- | Type directed equality on terms or types.
 compareAs :: forall m. MonadConversion m => Comparison -> CompareAs -> Term -> Term -> m ()
   -- If one term is a meta, try to instantiate right away. This avoids unnecessary unfolding.
@@ -205,9 +208,15 @@ compareAs cmp a u v = do
                              | otherwise = (assign rid y vs u, assign dir x us v)
         (MetaV x us, _) -> unlessSubtyping $ assign dir x us v `orelse` fallback
         (_, MetaV y vs) -> unlessSubtyping $ assign rid y vs u `orelse` fallback
-        (Def f es, Def f' es') | f == f' ->
-          ifNotM (optFirstOrder <$> pragmaOptions) fallback $ {- else -} unlessSubtyping $ do
+        (Def f es, Def f' es') | f == f' -> do
           def <- getConstInfo f
+          opts <- pragmaOptions
+          let shortcut = case theDef def of
+                _ | optFirstOrder opts                       -> True
+                d@Function{}
+                  | not $ optRequireUniqueMetaSolutions opts -> d ^. funFirstOrder
+                _                                            -> False
+          if not shortcut then fallback else unlessSubtyping $ do
           -- We do not shortcut projection-likes,
           -- Andreas, 2022-03-07, issue #5809:
           -- but irrelevant projections since they are applied to their parameters.
@@ -217,7 +226,7 @@ compareAs cmp a u v = do
           cubicalProjs <- traverse getName' [builtin_unglue, builtin_unglueU]
           let
             notFirstOrder = isJust (isRelevantProjection_ def)
-                         || any (Just f ==) cubicalProjs
+                         || (Just f) `elem` cubicalProjs
           if notFirstOrder then fallback else do
           pol <- getPolarity' cmp f
           whenProfile Profile.Conversion $ tick "compare first-order shortcut"
@@ -318,38 +327,89 @@ compareTerm' cmp a m n =
             then do
               whenProfile Profile.Conversion $ tick "compare at eta record"
               sig <- getSignature
-              let ps = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-              -- Andreas, 2010-10-11: allowing neutrals to be blocked things does not seem
-              -- to change Agda's behavior
-              --    isNeutral Blocked{}          = False
-                  isNeutral (NotBlocked _ Con{}) = return False
-              -- Andreas, 2013-09-18 / 2015-06-29: a Def by copatterns is
-              -- not neutral if it is blocked (there can be missing projections
-              -- to trigger a reduction.
-                  isNeutral (NotBlocked r (Def q _)) = do    -- Andreas, 2014-12-06 optimize this using r !!
-                    not <$> usesCopatterns q -- a def by copattern can reduce if projected
-                  isNeutral _                   = return True
-                  isMeta b = case ignoreBlocking b of
-                               MetaV{} -> True
-                               _       -> False
+
+              transp <- getPrimitiveName' builtinTrans
+              hcomp <- getPrimitiveName' builtinHComp
+
+              let
+                ps = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+                -- Andreas, 2010-10-11: allowing neutrals to be blocked things does not seem
+                -- to change Agda's behavior
+                --    isNeutral Blocked{}          = False
+                isNeutral (NotBlocked _ Con{}) = return False
+
+                -- Andreas, 2013-09-18 / 2015-06-29: a Def by copatterns is
+                -- not neutral if it is blocked (there can be missing projections
+                -- to trigger a reduction.
+                isNeutral (NotBlocked r (Def q _)) = do    -- Andreas, 2014-12-06 optimize this using r !!
+                  not <$> usesCopatterns q -- a def by copattern can reduce if projected
+                isNeutral _                   = return True
+
+                -- Amy, 2024-01-29: Is this blocked application headed by one of the
+                -- cubical primitives that behave as though they are copattern matching?
+                isCubicalPrimHead (NotBlocked r (Def q _)) -- Amy, 2024-01-29: optimise this using r !!
+                  | Just q == transp || Just q == hcomp
+                  = Just q
+                isCubicalPrimHead _ = Nothing
+
+                isMeta b = case ignoreBlocking b of
+                  MetaV{} -> True
+                  _       -> False
 
               reportSDoc "tc.conv.term" 30 $ prettyTCM a <+> "is eta record type"
               m <- reduceB m
               mNeutral <- isNeutral m
               n <- reduceB n
               nNeutral <- isNeutral n
+
+              let
+                h1 = isCubicalPrimHead m
+                h2 = isCubicalPrimHead n
+
+                mCub = isJust (isCubicalPrimHead m)
+                nCub = isJust (isCubicalPrimHead n)
+
+              when (mCub || nCub) $
+                reportSDoc "tc.conv.term.cubical" 30 $ vcat
+                  [ ("m (" <> prettyTCM mNeutral <> ", " <> prettyTCM mCub <> ", " <> prettyTCM h1 <> "):")
+                  , nest 2 (prettyTCM m)
+                  , ("n (" <> prettyTCM nNeutral <> ", " <> prettyTCM nCub <> ", " <> prettyTCM h2 <> "):")
+                  , nest 2 (prettyTCM n)
+                  , "at type"
+                  , nest 2 (prettyTCM a')
+                  , "same head:" <+> prettyTCM (h1 == h2)
+                  ]
+
               if | isMeta m || isMeta n -> do
                      whenProfile Profile.Conversion $ tick "compare at eta-record: meta"
                      compareAtom cmp (AsTermsOf a') (ignoreBlocking m) (ignoreBlocking n)
-                 | mNeutral && nNeutral -> do
+
+                 -- Amy, 2024-01-29 (fixing issue pointed out by Tom Jack):
+                 --
+                 -- Cubical primitives reduce to something awful, so we would like to skip comparing them (causes
+                 -- "timeout" in GroupPath).
+                 --
+                 -- We would also like to skip comparing a cubical primitive against something that is *small* and
+                 -- actually neutral (causes "timeout" in KleinBottle cohomology groups, comparing a 93KiB(!) transport
+                 -- against an application of set-truncation recursion to a metavariable)
+                 --
+                 -- The condition for skipping eta expansion is thus:
+                 --   (a) both are neutrals (which in this case also includes a "suspended"/copattern transp/hcomp)
+                 --   (b) if both are headed by a cubical primitive, then they are the same primitive.
+                 --
+                 -- So we will skip expanding transp A φ u0 = transp A' φ' u0', since it's definitionally injective; We
+                 -- will skip expanding transp A φ u0 = f ?, since it's wasted work; but we will not skip
+                 -- transp A φ u0 = hcomp u u0', since those must both compute if they are to be equal.
+                 | mNeutral && nNeutral && (not (mCub && nCub) || h1 == h2) -> do
                      whenProfile Profile.Conversion $ tick "compare at eta-record: both neutral"
                      -- Andreas 2011-03-23: (fixing issue 396)
                      -- if we are dealing with a singleton record,
                      -- we can succeed immediately
                      let profUnitEta = whenProfile Profile.Conversion $ tick "compare at eta-record: both neutral at unit"
-                     ifM (isSingletonRecordModuloRelevance r ps) (profUnitEta) $ do
+                     ifM (isSingletonRecordModuloRelevance r ps) profUnitEta $ do
                        -- do not eta-expand if comparing two neutrals
                        compareAtom cmp (AsTermsOf a') (ignoreBlocking m) (ignoreBlocking n)
+
                  | otherwise -> do
                      whenProfile Profile.Conversion $ tick "compare at eta-record: eta-expanding"
                      (tel, m') <- etaExpandRecord r ps $ ignoreBlocking m
@@ -512,12 +572,13 @@ compareAtom cmp t m n =
         dir = fromCmp cmp
         rid = flipCmp dir     -- The reverse direction.  Bad name, I know.
 
-        assign dir x es v = assignE dir x es v t $ compareAtomDir dir t
+        assign dir x es v = assignE dir x es v t $ compareAsDir dir t
 
     reportSDoc "tc.conv.atom" 30 $
       "compareAtom" <+> fsep [ prettyTCM mb <+> prettyTCM cmp
                              , prettyTCM nb
                              , prettyTCM t
+                             , prettyTCM blocker
                              ]
     reportSDoc "tc.conv.atom" 80 $
       "compareAtom" <+> fsep [ pretty mb <+> prettyTCM cmp
@@ -656,7 +717,10 @@ compareAtom cmp t m n =
                   s = tmSort $ unArg la
                   sucla = lsuc <$> la
               bA <- runNamesT [] $ do
-                [la,phi,bT,bAS] <- mapM (open . unArg) [la,phi,bT,bAS]
+                la  <- open . unArg $ la
+                phi <- open . unArg $ phi
+                bT  <- open . unArg $ bT
+                bAS <- open . unArg $ bAS
                 (pure tSubOut <#> (pure tLSuc <@> la) <#> (Sort . tmSort <$> la) <#> phi <#> (bT <@> primIZero) <@> bAS)
               compareAtom cmp (AsTermsOf $ El (tmSort . unArg $ sucla) $ apply tHComp $ [sucla, argH (Sort s), phi] ++ [argH (unArg bT), argH bA])
                               (unArg b) (unArg b')
@@ -685,13 +749,14 @@ compareAtom cmp t m n =
                 [ "t1 =" <+> prettyTCM t1
                 , "t2 =" <+> prettyTCM t2
                 ]
-              compareDom cmp dom2 dom1 b1 b2 errH errR errQ errC errF $
+              compareDom cmp dom2 dom1 b1 b2 errH errR errQ errC errP errF $
                 compareType cmp (absBody b1) (absBody b2)
             where
             errH = typeError $ UnequalHiding t1 t2
             errR = typeError $ UnequalRelevance cmp t1 t2
             errQ = typeError $ UnequalQuantity  cmp t1 t2
             errC = typeError $ UnequalCohesion cmp t1 t2
+            errP = typeError $ UnequalPolarity cmp t1 t2
             errF = typeError $ UnequalFiniteness cmp t1 t2
           _ -> __IMPOSSIBLE__
 
@@ -723,7 +788,8 @@ compareMetas cmp t x xArgs y yArgs | x == y = blockOnError (unblockOnMeta x) $ d
          -- not all relevant arguments are variables
          Nothing -> fallback
 compareMetas cmp t x xArgs y yArgs = do
-  [p1, p2] <- mapM getMetaPriority [x,y]
+  p1 <- getMetaPriority x
+  p2 <- getMetaPriority y
   let dir = fromCmp cmp
       rid = flipCmp dir     -- The reverse direction.  Bad name, I know.
       retry = patternViolation alwaysUnblock
@@ -753,22 +819,24 @@ compareDom :: (MonadConversion m , Free c)
   -> m ()     -- ^ Continuation if mismatch in 'Relevance'.
   -> m ()     -- ^ Continuation if mismatch in 'Quantity'.
   -> m ()     -- ^ Continuation if mismatch in 'Cohesion'.
+  -> m ()     -- ^ Continuation if mismatch in 'Polarity'.
   -> m ()     -- ^ Continuation if mismatch in 'annFinite'.
   -> m ()     -- ^ Continuation if comparison is successful.
   -> m ()
 compareDom cmp0
   dom1@(Dom{domInfo = i1, unDom = a1})
   dom2@(Dom{domInfo = i2, unDom = a2})
-  b1 b2 errH errR errQ errC errF cont = do
+  b1 b2 errH errR errQ errC errP errF cont = do
   if | not $ sameHiding dom1 dom2 -> errH
      | not $ (==)         (getRelevance dom1) (getRelevance dom2) -> errR
      | not $ sameQuantity (getQuantity  dom1) (getQuantity  dom2) -> errQ
      | not $ sameCohesion (getCohesion  dom1) (getCohesion  dom2) -> errC
+     | not $ samePolarity (getModalPolarity dom1) (getModalPolarity dom2) -> errP
      | not $ domIsFinite dom1 == domIsFinite dom2 -> errF
      | otherwise -> do
       let r = max (getRelevance dom1) (getRelevance dom2)
               -- take "most irrelevant"
-          dependent = (r /= Irrelevant) && isBinderUsed b2
+          dependent = not (isIrrelevant r) && isBinderUsed b2
       pid <- newProblem_ $ compareType cmp0 a1 a2
       dom <- if dependent
              then (\ a -> dom1 {unDom = a}) <$> blockTypeOnProblem a1 pid
@@ -1098,6 +1166,7 @@ compareArgs pol for a v args1 args2 =
 -- * Types
 ---------------------------------------------------------------------------
 
+{-# SPECIALIZE compareType :: Comparison -> Type -> Type -> TCM () #-}
 -- | Equality on Types
 compareType :: MonadConversion m => Comparison -> Type -> Type -> m ()
 compareType cmp ty1@(El s1 a1) ty2@(El s2 a2) =
@@ -1113,6 +1182,7 @@ compareType cmp ty1@(El s1 a1) ty2@(El s2 a2) =
 leqType :: MonadConversion m => Type -> Type -> m ()
 leqType = compareType CmpLeq
 
+{-# SPECIALIZE coerce :: Comparison -> Term -> Type -> Type -> TCM Term #-}
 -- | @coerce v a b@ coerces @v : a@ to type @b@, returning a @v' : b@
 --   with maybe extra hidden applications or hidden abstractions.
 --
@@ -1156,6 +1226,7 @@ coerce cmp v t1 t2 = blockTerm t2 $ do
   where
     fallback = v <$ coerceSize (compareType cmp) v t1 t2
 
+{-# SPECIALIZE coerceSize :: (Type -> Type -> TCM ()) -> Term -> Type -> Type -> TCM () #-}
 -- | Account for situations like @k : (Size< j) <= (Size< k + 1)@
 --
 --   Actually, the semantics is
@@ -1263,6 +1334,7 @@ leqSort s1 s2 = do
                    , nest 2 $ fsep [ pretty s1 <+> "=<"
                                    , pretty s2 ]
                    ]
+                 blocker <- updateBlocker blocker
                  addConstraint blocker $ SortCmp CmpLeq s1 s2
 
     propEnabled <- isPropEnabled
@@ -1405,7 +1477,7 @@ leqLevel a b = catchConstraint (LevelCmp CmpLeq a b) $ do
           | all neutralOrClosed bs , levelLowerBound a > levelLowerBound b -> notok
 
         -- ⊔ as ≤ single
-        (as@(_:|_:_), b :| []) ->
+        (as@(_ :| _ : _), b :| []) ->
           forM_ as $ \ a' -> leqLevel (unSingleLevel $ ignoreBlocking <$> a')
                                       (unSingleLevel $ ignoreBlocking <$> b)
 
@@ -1486,6 +1558,7 @@ leqLevel a b = catchConstraint (LevelCmp CmpLeq a b) $ do
         isMetaLevel (SinglePlus (Plus _ MetaV{})) = True
         isMetaLevel _                             = False
 
+{-# SPECIALIZE equalLevel :: Level -> Level -> TCM () #-}
 equalLevel :: forall m. MonadConversion m => Level -> Level -> m ()
 equalLevel a b = do
   reportSDoc "tc.conv.level" 50 $ sep [ "equalLevel", nest 2 $ parens $ pretty a, nest 2 $ parens $ pretty b ]
@@ -1576,9 +1649,9 @@ equalLevel a b = do
         (_ , SingleClosed n :| []) | n < levelLowerBound a -> notok
 
         -- 0 == a ⊔ b
-        (SingleClosed 0 :| [] , bs@(_:|_:_)) ->
+        (SingleClosed 0 :| [] , bs@(_ :| _ : _)) ->
           forM_ bs $ \ b' ->  equalLevel (ClosedLevel 0) (unSingleLevel $ ignoreBlocking <$> b')
-        (as@(_:|_:_) , SingleClosed 0 :| []) ->
+        (as@(_ :| _ : _) , SingleClosed 0 :| []) ->
           forM_ as $ \ a' -> equalLevel (unSingleLevel $ ignoreBlocking <$> a') (ClosedLevel 0)
 
         -- meta == any
@@ -1656,6 +1729,7 @@ equalLevel a b = do
         _                     `strictlySubsumes` _                     = False
 
 
+{-# SPECIALIZE equalSort :: Sort -> Sort -> TCM () #-}
 -- | Check that the first sort equal to the second.
 equalSort :: forall m. MonadConversion m => Sort -> Sort -> m ()
 equalSort s1 s2 = do
@@ -1682,7 +1756,7 @@ equalSort s1 s2 = do
     let (s1,s2) = (ignoreBlocking s1b, ignoreBlocking s2b)
         blocker = unblockOnEither (getBlocker s1b) (getBlocker s2b)
 
-    let postponeIfBlocked = catchPatternErr $ \blocker ->
+    let postponeIfBlocked = catchPatternErr $ \blocker -> do
           if | blocker == neverUnblock -> typeError $ UnequalSorts s1 s2
              | otherwise -> do
                  reportSDoc "tc.conv.sort" 30 $ vcat
@@ -1690,6 +1764,8 @@ equalSort s1 s2 = do
                    , nest 2 $ fsep [ prettyTCM s1 <+> "=="
                                    , prettyTCM s2 ]
                    ]
+                 -- Andreas, 2023-12-21, recomputing the blocker fixes issue #7034.
+                 blocker <- updateBlocker blocker
                  addConstraint blocker $ SortCmp CmpEq s1 s2
 
     propEnabled <- isPropEnabled
@@ -1877,7 +1953,7 @@ equalSort s1 s2 = do
           , "  s2 =" <+> prettyTCM s2
           ]
         sizedTypesEnabled <- sizedTypesOption
-        cubicalEnabled <- isJust . optCubical <$> pragmaOptions
+        cubicalEnabled <- isJust <$> cubicalOption
         levelUnivEnabled <- optLevelUniverse <$> pragmaOptions
         let postpone = patternViolation blocker
             err :: m ()
@@ -2044,7 +2120,7 @@ forallFaceMaps t kb k = do
       let t = foldr (\ x r -> and `apply` [argN x,argN r]) io ts
       ifBlocked t blocked unblocked
     addBindings [] m = m
-    addBindings ((Dom{domInfo = info,unDom = (nm,ty)},t):bs) m = addLetBinding info Inserted nm t ty (addBindings bs m)
+    addBindings ((CtxVar nm Dom{domInfo = info,unDom = ty},t):bs) m = addLetBinding info Inserted nm t ty (addBindings bs m)
 
     substContextN :: MonadConversion m => Context -> [(Int,Term)] -> m (Context , Substitution)
     substContextN c [] = return (c, idS)

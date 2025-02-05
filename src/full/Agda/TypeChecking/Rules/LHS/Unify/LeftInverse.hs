@@ -10,8 +10,6 @@ import Control.Monad
 import Control.Monad.State
 import Control.Monad.Except
 
-
-import Agda.Interaction.Options (optCubical)
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 
@@ -57,7 +55,7 @@ data NoLeftInv
 buildLeftInverse :: (PureTCM tcm, MonadError TCErr tcm) => UnifyState -> UnifyLog -> tcm (Either NoLeftInv (Substitution, Substitution))
 buildLeftInverse s0 log = do
   reportSDoc "tc.lhs.unify.inv.badstep" 20 $ do
-    cubical <- optCubical <$> pragmaOptions
+    cubical <- cubicalOption
     "cubical:" <+> text (show cubical)
   reportSDoc "tc.lhs.unify.inv.badstep" 20 $ do
     pathp <- getTerm' builtinPathP
@@ -200,7 +198,8 @@ composeRetract (prob0,rho0,tau0,leftInv0) phi0 (prob1,rho1,tau1,leftInv1) = do
   interval <- primIntervalType
   max <- primIMax
   neg <- primINeg
-  Right leftInv <- fmap sequenceA $ addContext prob0 $ runNamesT (teleNames prob0) $ do
+  result <- sequenceA <$> do
+    addContext prob0 $ runNamesT (teleNames prob0) $ do
              phi <- open phi0
              g0 <- open $ raise (size prob0) prob0
              step0 <- open $ Abs "i" $ step0 `applySubst` teleArgs prob0
@@ -212,14 +211,23 @@ composeRetract (prob0,rho0,tau0,leftInv0) phi0 (prob1,rho1,tau1,leftInv1) = do
               leftInv0 <- leftInv0
               i <- i
               -- this composition could be optimized further whenever step0i is actually constant in i.
-              lift $ (runExceptT $ map unArg <$> transpSysTel' True tel [(i, leftInv0)] face step0i)
-  addContext prob0 $ addContext ("r" :: String, __DUMMY_DOM__) $
-    reportSDoc "tc.lhs.unify.inv" 20 $ "leftInv  :" <+> prettyTCM (absBody leftInv)
-  addContext prob0 $ addContext ("r" :: String, __DUMMY_DOM__) $
-    reportSDoc "tc.lhs.unify.inv" 40 $ "leftInv  :" <+> pretty (absBody leftInv)
-  addContext prob0 $ addContext ("r" :: String, __DUMMY_DOM__) $
-    reportSDoc "tc.lhs.unify.inv" 40 $ "leftInvSub  :" <+> pretty (termsS __IMPOSSIBLE__ $ absBody $ leftInv)
-  return (prob, rho, tau , termsS __IMPOSSIBLE__ $ absBody $ leftInv)
+              lift $ runExceptT (map unArg <$> transpSysTel' True tel [(i, leftInv0)] face step0i)
+  leftInv <- case result of
+    Right x  -> pure x
+    Left cl -> do
+      reportSDoc "impossible" 10 $ vcat
+        [ "transpSysTel' errored with term"
+        , prettyTCM cl
+        ]
+      __IMPOSSIBLE__
+
+  let sigma = termsS __IMPOSSIBLE__ $ absBody leftInv
+  verboseS "tc.lhs.unify.inv" 20 do
+    addContext prob0 $ addContext ("r" :: String, __DUMMY_DOM__) do
+      reportSDoc "tc.lhs.unify.inv" 20 $ "leftInv    :" <+> prettyTCM (absBody leftInv)
+      reportSDoc "tc.lhs.unify.inv" 40 $ "leftInv    :" <+> pretty (absBody leftInv)
+      reportSDoc "tc.lhs.unify.inv" 40 $ "leftInvSub :" <+> pretty sigma
+  return (prob, rho, tau, sigma)
 
 buildEquiv :: forall tcm. (PureTCM tcm, MonadError TCErr tcm) => UnifyLogEntry -> UnifyState -> tcm (Either NoLeftInv (Retract,Term))
 buildEquiv (UnificationStep st step@(Solution k ty fx tm side) output) next = runExceptT $ do
@@ -253,8 +261,8 @@ buildEquiv (UnificationStep st step@(Solution k ty fx tm side) output) next = ru
           ]
         (tau,leftInv,phi) <- addContext working_tel $ runNamesT [] $ do
           let raiseFrom tel x = raise (size working_tel - size tel) x
-
-          [u,v] <- mapM (open . raiseFrom gamma . unArg) [u,v]
+          u <- open . raiseFrom gamma . unArg $ u
+          v <- open . raiseFrom gamma . unArg $ v
           -- φ
           let phi = raiseFrom gamma_phis $ var 0
           -- working_tel ⊢ γ₁,x,γ₂,φ,eqs
@@ -349,7 +357,7 @@ buildEquiv (UnificationStep st step@(Solution k ty fx tm side) output) next = ru
             delta1 <- bind "i" $ \ i -> do
 
                    args <- mapM (open . unArg) =<< (lazyAbsApp <$> xi0f <*> i)
-                   apply <$> applyN krest ((take 1 $ csingl' i) ++ args) <*> (drop 1 `fmap` csingl i)
+                   apply <$> applyN krest (take 1 (csingl' i) ++ args) <*> (drop 1 `fmap` csingl i)
             delta1 <- open delta1
             xi1f <- bind "i" $ \ i -> do
                                  m <- trFillTel' flag <$> delta1 <*> phi <*> xi1 <*> i
@@ -406,7 +414,7 @@ buildEquiv (UnificationStep st step@(EtaExpandVar fv _d _args) output) next = fm
         interval <- primIntervalType
          -- Γ, φs : I^phis
         let gamma_phis = abstract gamma $ telFromList $
-              map (defaultDom . (,interval) . ("phi"++) . show) [0 .. phis - 1]
+              map (defaultDom . (,interval) . ("phi" ++) . show) [0 .. phis - 1]
         working_tel <- abstract gamma_phis <$>
           pathTelescope (raise phis $ eqTel st) (raise phis $ eqLHS st) (raise phis $ eqRHS st)
         let raiseFrom tel x = (size working_tel - size tel) + x
@@ -429,6 +437,7 @@ buildEquiv (UnificationStep st step output) _ = do
     Cycle{}       -> __IMPOSSIBLE__
     _ -> unsupported
 
+{-# SPECIALIZE explainStep :: UnifyStep -> TCM Doc #-}
 explainStep :: MonadPretty m => UnifyStep -> m Doc
 explainStep Injectivity{injectConstructor = ch} =
   "injectivity of the data constructor" <+> prettyTCM (conName ch)

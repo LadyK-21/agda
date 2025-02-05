@@ -16,16 +16,16 @@ import Agda.Interaction.Highlighting.LaTeX.Base
 import Control.DeepSeq
 import Control.Monad.Trans (MonadIO)
 
-import qualified Data.Map as Map
-import Data.Map (Map)
-
-import qualified Data.Text as T
+import           Data.Functor ( (<&>) )
+import qualified Data.Map     as Map
+import           Data.Map     ( Map )
+import qualified Data.Text    as T
 
 import GHC.Generics (Generic)
 
 import System.FilePath ( (</>) )
 
-import Agda.Compiler.Backend (Backend(..), Backend'(..), Definition, Recompile(..))
+import Agda.Compiler.Backend (Backend,Backend_boot(..), Backend',Backend'_boot(..), Definition, Recompile(..))
 import Agda.Compiler.Common (curIF, IsMain(IsMain, NotMain))
 
 import Agda.Interaction.Options
@@ -42,10 +42,12 @@ import Agda.Syntax.TopLevelModuleName (TopLevelModuleName, projectRoot)
 import Agda.TypeChecking.Monad
   ( HasOptions(commandLineOptions)
   , MonadDebug
-  , stModuleToSource
+  , stModuleToSourceId
   , useTC
   , ReadTCState
   , reportS
+  , MonadFileId
+  , srcFilePath
   )
 
 import Agda.Utils.FileName (filePath, mkAbsolute)
@@ -112,20 +114,27 @@ latexBackend' = Backend'
   , postCompile           = postCompileLaTeX
   , scopeCheckingSuffices = True
   , mayEraseType          = const $ return False
+  , backendInteractTop    = Nothing
+  , backendInteractHole   = Nothing
   }
 
 runLogLaTeXWithMonadDebug :: MonadDebug m => LogLaTeXT m a -> m a
 runLogLaTeXWithMonadDebug = runLogLaTeXTWith $ (reportS "compile.latex" 1) . T.unpack . logMsgToText
 
 -- Resolve the raw flags into usable LaTeX options.
-resolveLaTeXOptions :: (HasOptions m, ReadTCState m) => LaTeXFlags -> TopLevelModuleName -> m LaTeXOptions
+resolveLaTeXOptions :: (HasOptions m, ReadTCState m, MonadFileId m)
+  => LaTeXFlags
+  -> TopLevelModuleName
+  -> m LaTeXOptions
 resolveLaTeXOptions flags moduleName = do
   options <- commandLineOptions
-  modFiles <- useTC stModuleToSource
+  modFiles <- useTC stModuleToSourceId
+  let msrc = Map.lookup moduleName modFiles
+  mf <- traverse srcFilePath msrc
   let
-    mSrcFileName =
-      (\f -> mkRangeFile (mkAbsolute (filePath f)) (Just moduleName)) <$>
-      Map.lookup moduleName modFiles
+    mSrcFileName = mf <&> \ f ->
+      mkRangeFile (mkAbsolute (filePath f)) (Just moduleName)
+      -- TODO:    ^^^^^^^^^^^^^^^^^^^^^^^^^ can this just be `f`?
     countClusters = optCountClusters . optPragmaOptions $ options
     latexDir = latexFlagOutDir flags
     -- FIXME: This reliance on emacs-mode to decide whether to interpret the output location as project-relative or
@@ -149,7 +158,7 @@ preCompileLaTeX
 preCompileLaTeX flags = pure $ LaTeXCompileEnv flags
 
 preModuleLaTeX
-  :: (HasOptions m, ReadTCState m)
+  :: (HasOptions m, ReadTCState m, MonadFileId m)
   => LaTeXCompileEnv
   -> IsMain
   -> TopLevelModuleName

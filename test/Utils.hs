@@ -1,6 +1,10 @@
+{-# OPTIONS_GHC -Wno-unused-imports #-}
 
-module Utils (module Utils,
-              AgdaError(..)) where
+module Utils
+  ( module Utils
+  , AgdaError(..)
+  , dropAgdaExtension
+  ) where
 
 import Control.Applicative
 import Control.Arrow ((&&&))
@@ -27,7 +31,7 @@ import System.Exit
 import System.FilePath
 import qualified System.FilePath.Find as Find
 import System.FilePath.GlobPattern
--- import System.IO                     ( hPutStrLn, stderr )
+import System.IO                     ( hPutStrLn, stderr )
 import System.IO.Temp
 import System.PosixCompat.Time       ( epochTime )
 import System.PosixCompat.Files      ( modificationTime, touchFile )
@@ -43,9 +47,14 @@ import qualified Text.Regex.TDFA.Text as RT ( compile )
 
 import Agda.Compiler.MAlonzo.Compiler ( ghcInvocationStrings )
 import Agda.Interaction.ExitCode      ( AgdaError(..), agdaErrorFromInt )
+import Agda.Interaction.FindFile      ( dropAgdaExtension, hasAgdaExtension, stripAgdaExtension )
+
 import Agda.Utils.Maybe
 import Agda.Utils.Environment
+import Agda.Utils.FileName            ( stripAnyOfExtensions )
 import Agda.Utils.Functor
+import Agda.Utils.IO.Directory        ( findWithInfo )
+
 import qualified Agda.Version (package)
 
 data ProgramResult = ProgramResult
@@ -65,17 +74,27 @@ printProgramResult = printProcResult . fromProgramResult
 
 type AgdaArgs = [String]
 
-
-readAgdaProcessWithExitCode :: Maybe EnvVars  -- ^ Extra environment variables, unexpanded.
-                            -> AgdaArgs -> Text
-                            -> IO (ExitCode, Text, Text)
+-- | Call out to @AGDA_BIN@ with given arguments and standard input,
+--   recording exit code, standard output and standard error.
+readAgdaProcessWithExitCode ::
+     Maybe EnvVars  -- ^ Extra environment variables, unexpanded.
+  -> AgdaArgs       -- ^ Arguments to @agda@.
+  -> Text           -- ^ @stdin@.
+  -> IO (ExitCode, Text, Text)
 readAgdaProcessWithExitCode extraEnv args inp = do
   origEnv <- getEnvironment
   home <- getHomeDirectory
   let env = expandEnvVarTelescope home $ maybe origEnv (origEnv ++) extraEnv
   let envArgs = maybe [] words $ lookup "AGDA_ARGS" env
+  let agdaBin = getAgdaBin env
   -- hPutStrLn stderr $ unwords $ agdaBin : envArgs ++ args
-  let agdaProc = (proc (getAgdaBin env) (envArgs ++ args)) { create_group = True , env = Just env }
+  let agdaProc = (proc agdaBin (envArgs ++ args))
+        { create_group = True
+        , env          = Just env
+        , cwd          = Just "."
+            -- Andreas, 2023-10-07, issue #6905:
+            -- Setting cwd='.' works around a bug in process-1.6.14..17 on macOS.
+        }
   PT.readCreateProcessWithExitCode agdaProc inp
 
 data AgdaResult
@@ -127,9 +146,7 @@ runAgdaWithOptions testName opts mflag mvars = do
         -- a missing '=' might mean to set the variable to the empty string.
 
 hasWarning :: Text -> Bool
-hasWarning t =
- "———— All done; warnings encountered ————————————————————————"
- `T.isInfixOf` t
+hasWarning = T.isInfixOf "warning: -W[no]"
 
 getAgdaBin :: EnvVars -> FilePath
 getAgdaBin = getProg "agda"
@@ -141,17 +158,6 @@ getAgdaBin = getProg "agda"
 getProg :: String -> EnvVars -> FilePath
 getProg prog = fromMaybe prog . lookup (map toUpper prog ++ "_BIN")
 
--- | List of possible extensions of agda files.
-agdaExtensions :: [String]
-agdaExtensions =
-  [ ".agda"
-  , ".lagda"
-  , ".lagda.tex"
-  , ".lagda.rst"
-  , ".lagda.md"
-  , ".lagda.org"
-  ]
-
 -- | List of files paired with agda files by the test suites.
 -- E.g. files recording the accepted output or error message.
 helperExtensions :: [String]
@@ -162,24 +168,8 @@ helperExtensions =
   , ".in", ".out"   -- For running test/interaction
   ]
 
--- | Generalizes 'stripExtension'.
-stripAnyOfExtensions :: [String] -> FilePath -> Maybe FilePath
-stripAnyOfExtensions exts p = listToMaybe $ catMaybes $ map (`stripExtension` p) exts
-
-stripAgdaExtension :: FilePath -> Maybe FilePath
-stripAgdaExtension = stripAnyOfExtensions agdaExtensions
-
 stripHelperExtension :: FilePath -> Maybe FilePath
 stripHelperExtension = stripAnyOfExtensions helperExtensions
-
--- | Checks if a String has Agda extension
-hasAgdaExtension :: FilePath -> Bool
-hasAgdaExtension = isJust . stripAgdaExtension
-
-dropAgdaExtension :: FilePath -> FilePath
-dropAgdaExtension p =
-  fromMaybe (error $ "Utils.hs: Path " ++ p ++ " does not have an Agda extension") $
-  stripAgdaExtension p
 
 dropAgdaOrOtherExtension :: FilePath -> FilePath
 dropAgdaOrOtherExtension = fromMaybe <$> dropExtension <*> stripAgdaExtension
@@ -233,25 +223,6 @@ getAgdaFilesInDir recurse dir = do
     | otherwise   = old
   -- Test cases from up to one week ago are considered new.
   consideredNew = 7 * 24 * 60 * 60
-
--- | Search a directory recursively, with recursion controlled by a
---   'RecursionPredicate'.  Lazily return a unsorted list of all files
---   matching the given 'FilterPredicate'.  Any errors that occur are
---   ignored, with warnings printed to 'stderr'.
-findWithInfo
-  :: Find.RecursionPredicate  -- ^ Control recursion into subdirectories.
-  -> Find.FilterPredicate     -- ^ Decide whether a file appears in the result.
-  -> FilePath                 -- ^ Directory to start searching.
-  -> IO [Find.FileInfo]       -- ^ Files that matched the 'FilterPredicate'.
-findWithInfo recurse filt dir = Find.fold recurse act [] dir
-  where
-  -- Add file to list front when it matches the filter
-  act :: [Find.FileInfo] -> Find.FileInfo -> [Find.FileInfo]
-  act = flip $ consIf $ Find.evalClause filt
-
--- | Prepend element if it satisfies the given condition.
-consIf :: (a -> Bool) -> a -> [a] -> [a]
-consIf p a = if p a then (a :) else id
 
 -- | An Agda file path as test name
 asTestName :: FilePath -> FilePath -> String
@@ -312,6 +283,7 @@ cleanOutput' agda pwd t = foldl (\ t' (rgx, n) -> replace rgx n t') t rgxs
         -- First, replace backslashes by slashes, then try to match @pwd@,
         -- which has already backslashes by slashes replaced.
       , (T.pack pwd `T.append` ".test", "..")
+      , ("/[^ ]*/MAlonzo/Code/", "«path»/MAlonzo/Code/")
       , ("\\.hs(:[[:digit:]]+){2}", ".hs:«line»:«col»")
       , (T.pack Agda.Version.package, "«Agda-package»")
       -- Andreas, 2021-08-26.  When run with 'cabal test',
@@ -391,3 +363,14 @@ goldenVsAction' name ref act toTxt =
     textDiff
     ShowText
     (BS.writeFile ref . encodeUtf8)
+
+-- | Scrapes the output of @agda --version@
+-- to determine whether agda was built with or without
+-- the @-fdebug@ cabal flag.
+wasAgdaCompiledWithFDebug :: IO Bool
+wasAgdaCompiledWithFDebug = do
+  (_code , out, _err) <-
+    readAgdaProcessWithExitCode
+      Nothing ["--version"] ""
+  let flines = dropWhile (/= "Built with flags (cabal -f)") $ T.lines out
+  return $ " - debug: enable debug printing ('-v' verbosity flags)" `elem` flines

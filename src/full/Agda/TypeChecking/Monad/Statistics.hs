@@ -16,8 +16,6 @@ import Control.Monad.Trans.Maybe
 import qualified Data.Map as Map
 import qualified Text.PrettyPrint.Boxes as Boxes
 
-import Agda.Syntax.TopLevelModuleName (TopLevelModuleName)
-
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Debug
 
@@ -89,6 +87,6 @@ printStatistics mmname stats = do
         -- Second column (right aligned) is numbers.
         col2 = Boxes.vcat Boxes.right $ map (Boxes.text . showThousandSep . snd) stats
         table = Boxes.hsep 1 Boxes.left [col1, col2]
-    reportSLn "" 1 $ caseMaybe mmname "Accumulated statistics" $ \ mname ->
+    alwaysReportSLn "" 1 $ caseMaybe mmname "Accumulated statistics" $ \ mname ->
       "Statistics for " ++ prettyShow mname
-    reportSLn "" 1 $ Boxes.render table
+    alwaysReportSLn "" 1 $ Boxes.render table

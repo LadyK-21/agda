@@ -6,7 +6,6 @@ module Agda.TypeChecking.Rules.Decl where
 
 import Prelude hiding ( null )
 
-import Control.Monad
 import Control.Monad.Writer (tell)
 
 import Data.Either (partitionEithers)
@@ -20,11 +19,12 @@ import Agda.Interaction.Highlighting.Generate
 import Agda.Interaction.Options
 
 import qualified Agda.Syntax.Abstract as A
-import Agda.Syntax.Abstract.Views (deepUnscopeDecl, deepUnscopeDecls, unScope)
+import Agda.Syntax.Abstract.Views (deepUnscopeDecl, deepUnscopeDecls)
 import Agda.Syntax.Internal
 import qualified Agda.Syntax.Info as Info
 import Agda.Syntax.Position
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Literal
 import Agda.Syntax.Scope.Base ( KindOfName(..) )
 
@@ -37,6 +37,7 @@ import Agda.TypeChecking.Conversion
 import Agda.TypeChecking.IApplyConfluence
 import Agda.TypeChecking.Generalize
 import Agda.TypeChecking.Injectivity
+import Agda.TypeChecking.InstanceArguments
 import Agda.TypeChecking.Level.Solve
 import Agda.TypeChecking.Positivity
 import Agda.TypeChecking.Positivity.Occurrence
@@ -64,15 +65,17 @@ import Agda.TypeChecking.Rules.Display ( checkDisplayPragma )
 
 import Agda.Termination.TermCheck
 
-import Agda.Utils.Function ( applyUnless )
+import Agda.Utils.Function ( applyUnless, applyWhen )
 import Agda.Utils.Functor
 import Agda.Utils.Lens
+import Agda.Utils.List1 ( List1, pattern (:|) )
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Size
 import Agda.Utils.Update
+import qualified Agda.Syntax.Common.Pretty as P
 import qualified Agda.Utils.SmallSet as SmallSet
 
 import Agda.Utils.Impossible
@@ -153,7 +156,7 @@ checkDecl d = setCurrentRange d $ do
       A.Primitive i x e        -> meta $ checkPrimitive i x e
       A.Mutual i ds            -> mutual i ds $ checkMutual i ds
       A.Section _r er x tel ds -> meta $ checkSection er x tel ds
-      A.Apply i e x mapp ci d  -> meta $ checkSectionApplication i e x mapp ci d
+      A.Apply i er x mapp ci d -> meta $ checkSectionApplication i er x mapp ci d
       A.Import _ _ dir         -> none $ checkImportDirective dir
       A.Pragma i p             -> none $ checkPragma i p
       A.ScopedDecl scope ds    -> none $ setScope scope >> mapM_ checkDeclCached ds
@@ -161,7 +164,7 @@ checkDecl d = setCurrentRange d $ do
       A.DataDef i x uc ps cs   -> impossible $ check x i $ checkDataDef i x uc ps cs
       A.RecDef i x uc dir ps tel cs -> impossible $ check x i $ do
                                     checkRecDef i x uc dir ps tel cs
-                                    blockId <- mutualBlockOf x
+                                    blockId <- defMutual <$> getConstInfo x
 
                                     -- Andreas, 2016-10-01 testing whether
                                     -- envMutualBlock is set correctly.
@@ -215,16 +218,17 @@ checkDecl d = setCurrentRange d $ do
       whenJust finalChecks $ \ theMutualChecks -> do
         reportSLn "tc.decl" 20 $ "Attempting to solve constraints before freezing."
         wakeupConstraints_   -- solve emptiness and instance constraints
+
         checkingWhere <- asksTC envCheckingWhere
         solveSizeConstraints $ if checkingWhere then DontDefaultToInfty else DefaultToInfty
         wakeupConstraints_   -- Size solver might have unblocked some constraints
-        case d of
-            A.Generalize{} -> pure ()
-            _ -> do
-              reportSLn "tc.decl" 20 $ "Freezing all open metas."
-              void $ freezeMetas (openMetas metas)
-
         theMutualChecks
+
+        case d of
+          A.Generalize{} -> pure ()
+          _ -> do
+            reportSLn "tc.decl" 20 $ "Freezing all open metas."
+            void $ freezeMetas (openMetas metas)
 
     where
 
@@ -447,7 +451,7 @@ checkTermination_ d = Bench.billTo [Bench.Termination] $ do
   reportSLn "tc.decl" 20 $ "checkDecl: checking termination..."
   -- If there are some termination errors, we throw a warning.
   -- The termination checker already marked non-terminating functions as such.
-  unlessNullM (termDecl d) $ \ termErrs -> do
+  List1.unlessNullM (termDecl d) \ termErrs -> do
     warning $ TerminationIssue termErrs
 
 -- | Check a set of mutual names for positivity.
@@ -460,17 +464,6 @@ checkPositivity_ mi names = Bench.billTo [Bench.Positivity] $ do
   -- Andreas, 2012-02-13: Polarity computation uses information from the
   -- positivity check, so it needs happen after the positivity check.
   computePolarity $ Set.toList names
-
--- | Check that all coinductive records are actually recursive.
---   (Otherwise, one can implement invalid recursion schemes just like
---   for the old coinduction.)
-checkCoinductiveRecords :: [A.Declaration] -> TCM ()
-checkCoinductiveRecords ds = forM_ ds $ \case
-  A.RecDef _ q _ dir _ _ _
-    | Just (Ranged r CoInductive) <- recInductive dir -> setCurrentRange r $ do
-    unlessM (isRecursiveRecord q) $ typeError $ GenericError $
-      "Only recursive records can be coinductive"
-  _ -> return ()
 
 -- | Check a set of mutual names for constructor-headedness.
 checkInjectivity_ :: Set QName -> TCM ()
@@ -573,20 +566,19 @@ checkGeneralize s i info x e = do
       ]
 
     lang <- getLanguage
-    addConstant x $ (defaultDefn info x tGen lang GeneralizableVar)
-                    { defArgGeneralizable = SomeGeneralizableArgs n }
-
+    addConstant x $ defaultDefn info x tGen lang $
+      GeneralizableVar $ SomeGeneralizableArgs n
 
 -- | Type check an axiom.
 checkAxiom :: KindOfName -> A.DefInfo -> ArgInfo ->
-              Maybe [Occurrence] -> QName -> A.Expr -> TCM ()
+              Maybe (List1 Occurrence) -> QName -> A.Expr -> TCM ()
 checkAxiom = checkAxiom' Nothing
 
 -- | Data and record type signatures need to remember the generalized
 --   parameters for when checking the corresponding definition, so for these we
 --   pass in the parameter telescope separately.
 checkAxiom' :: Maybe A.GeneralizeTelescope -> KindOfName -> A.DefInfo -> ArgInfo ->
-               Maybe [Occurrence] -> QName -> A.Expr -> TCM ()
+               Maybe (List1 Occurrence) -> QName -> A.Expr -> TCM ()
 checkAxiom' gentel kind i info0 mp x e = whenAbstractFreezeMetasAfter i $ defaultOpenLevelsToZero $ do
   -- Andreas, 2016-07-19 issues #418 #2102:
   -- We freeze metas in type signatures of abstract definitions, to prevent
@@ -602,9 +594,16 @@ checkAxiom' gentel kind i info0 mp x e = whenAbstractFreezeMetasAfter i $ defaul
   -- Andrea, 2019-07-16 Cohesion is purely based on left-division, it
   -- does not take envModality into account.
   let c = getCohesion info0
-  let mod  = Modality rel (getQuantity info0) c
+  let p = getModalPolarity info0
+  let mod  = Modality rel (getQuantity info0) c p
   let info = setModality mod info0
-  applyCohesionToContext c $ do
+
+  -- For now, top-level polarity annotations are forbidden
+  when (p /= defaultPolarity) $ warning $ TopLevelPolarity x p
+
+  polarityEnabled <- optPolarity <$> pragmaOptions
+
+  applyWhen polarityEnabled (applyPolarityToContext p) $ applyCohesionToContext c $ do
 
   reportSDoc "tc.decl.ax" 20 $ sep
     [ text $ "checking type signature"
@@ -636,23 +635,36 @@ checkAxiom' gentel kind i info0 mp x e = whenAbstractFreezeMetasAfter i $ defaul
   -- modules!
   when (kind == AxiomName) $ do
     whenM ((== SizeUniv) <$> do reduce $ getSort t) $ do
-      whenM ((> 0) <$> getContextSize) $ do
-        typeError $ GenericError $ "We don't like postulated sizes in parametrized modules."
+      whenM ((> 0) <$> getContextSize) $ typeError PostulatedSizeInModule
 
-  -- Ensure that polarity pragmas do not contain too many occurrences.
-  (occs, pols) <- case mp of
-    Nothing   -> return ([], [])
-    Just occs -> do
-      TelV tel _ <- telView t
-      let n = length (telToList tel)
-      when (n < length occs) $
+  -- get explicitely specified occurences (by looking at polarity annotations, if enabled)
+  eoccs <-
+    if polarityEnabled
+      then do
+        args <- telToList . theTel <$> telView t
+        return $ fmap (modalPolarityToOccurrence . modPolarityAnn . getModalPolarity) args
+      else return []
+
+  -- Lucas, 2022-11-30: If this is a datatype, forbid polarity annotations for indices
+  when (kind == DataName && any (/= Mixed) (drop npars eoccs)) $
+    typeError $ GenericError "Cannot annotate datatype indices with polarity other than Mixed."
+
+  occs <- case mp of
+    Nothing -> return eoccs
+    Just occs1 -> do
+      -- If any polarity retrieved from the type is not Mixed, it means an explicit
+      -- annotation was given, so we throw an error because the pragma shouldn't be used
+      when (any (/= Mixed) eoccs) $ typeError (ExplicitPolarityVsPragma x)
+
+      -- Ensure that polarity pragmas do not contain too many occurrences.
+      let occs = List1.toList occs1
+      let m = length occs
+      TelV tel _ <- telViewUpTo m t
+      let n = size tel
+      when (n < m) $
         typeError $ TooManyPolarities x n
-      let pols = map polFromOcc occs
-      reportSLn "tc.polarity.pragma" 10 $
-        "Setting occurrences and polarity for " ++ prettyShow x ++ ":\n  " ++
-        prettyShow occs ++ "\n  " ++ prettyShow pols
-      return (occs, pols)
 
+      return occs
 
   -- Set blocking tag to MissingClauses if we still expect clauses
   let blk = case kind of
@@ -665,11 +677,7 @@ checkAxiom' gentel kind i info0 mp x e = whenAbstractFreezeMetasAfter i $ defaul
 
   lang <- getLanguage
   funD <- emptyFunctionData
-  let genArgs = case kind of
-                  FunName -> case unScope e of
-                    A.Generalized s _ -> SomeGeneralizableArgs (Set.size s)
-                    _ -> NoGeneralizableArgs
-                  _ -> NoGeneralizableArgs
+
   let defn = defaultDefn info x t lang $
         case kind of   -- #4833: set abstract already here so it can be inherited by with functions
           FunName   -> fun
@@ -678,16 +686,22 @@ checkAxiom' gentel kind i info0 mp x e = whenAbstractFreezeMetasAfter i $ defaul
           RecName   -> DataOrRecSig npars
           AxiomName -> defaultAxiom     -- Old comment: NB: used also for data and record type sigs
           _         -> __IMPOSSIBLE__
-        where fun = FunctionDefn funD{ _funAbstr = Info.defAbstract i, _funOpaque = Info.defOpaque i }
+        where
+          fun = FunctionDefn $ set funAbstr_ (Info.defAbstract i) funD{ _funOpaque = Info.defOpaque i }
+
+  let pols = map polFromOcc occs
 
   addConstant x =<< do
     useTerPragma $ defn
         { defArgOccurrences    = occs
         , defPolarity          = pols
         , defGeneralizedParams = genParams
-        , defArgGeneralizable  = genArgs
         , defBlocked           = blk
         }
+
+  reportSLn "tc.polarity" 10 $
+    "Setting occurrences and polarity for " ++ prettyShow x ++ ":\n  " ++
+    prettyShow occs ++ "\n  " ++ prettyShow pols
 
   -- Add the definition to the instance table, if needed
   case Info.defInstance i of
@@ -732,9 +746,9 @@ checkPrimitive i x (Arg info e) =
     -- future. Thus, rather than, the arguably nicer solution of adding an
     -- ArgInfo to PrimImpl we simply check the few special primitives here.
     let expectedInfo =
-          case name of
-            -- Currently no special primitives
-            _ -> defaultArgInfo
+          -- Currently no special primitives
+          -- case name of _ ->
+                        defaultArgInfo
     unless (info == expectedInfo) $
       typeError $ WrongArgInfoForPrimitive name info expectedInfo
     bindPrimitive name pf
@@ -751,7 +765,8 @@ checkPrimitive i x (Arg info e) =
 
 -- | Check a pragma.
 checkPragma :: Range -> A.Pragma -> TCM ()
-checkPragma r p =
+checkPragma r p = do
+    let uselessPragma = warning . UselessPragma r
     traceCall (CheckPragma r p) $ case p of
         A.BuiltinPragma rb x
           | any isUntypedBuiltin b -> return ()
@@ -768,44 +783,62 @@ checkPragma r p =
         A.CompilePragma b x s -> do
           -- Check that x resides in the same module (or a child) as the pragma.
           x' <- defName <$> getConstInfo x  -- Get the canonical name of x.
-          unlessM ((x' `isInModule`) <$> currentModule) $
-            typeError $ GenericError $
+          ifM ((x' `isInModule`) <$> currentModule)
+            {- then -} (addPragma (rangedThing b) x s)
+            {- else -} $ uselessPragma
               "COMPILE pragmas must appear in the same module as their corresponding definitions,"
-          addPragma (rangedThing b) x s
+
         A.StaticPragma x -> do
-          def <- getConstInfo x
+          def <- ignoreAbstractMode $ getConstInfo x
           case theDef def of
             Function{} -> markStatic x
-            _          -> typeError $ GenericError "STATIC directive only works on functions"
+            _          -> uselessPragma "STATIC directive only applies to functions"
         A.InjectivePragma x -> markInjective x
+        A.InjectiveForInferencePragma x -> do
+          def <- ignoreAbstractMode $ getConstInfo x
+          case theDef def of
+            Function{} -> markFirstOrder x
+            _ -> uselessPragma "INJECTIVE_FOR_INFERENCE directive only applies to functions"
         A.NotProjectionLikePragma qn -> do
-          def <- getConstInfo qn
+          def <- ignoreAbstractMode $ getConstInfo qn
           case theDef def of
             it@Function{} ->
               modifyGlobalDefinition qn $ \def -> def { theDef = it { funProjection = Left NeverProjection } }
-            _ -> typeError $ GenericError "NOT_PROJECTION_LIKE directive only applies to functions"
+            _ -> uselessPragma "NOT_PROJECTION_LIKE directive only applies to functions"
         A.InlinePragma b x -> do
-          def <- getConstInfo x
+          def <- ignoreAbstractMode $ getConstInfo x
           case theDef def of
             Function{} -> markInline b x
             d@Constructor{ conSrcCon } | copatternMatchingAllowed conSrcCon
               -> modifyGlobalDefinition x $ set lensTheDef d{ conInline = b }
-            _ -> typeError $ GenericError $ applyUnless b ("NO" ++) "INLINE directive only works on functions or constructors of records that allow copattern matching"
-        A.OptionsPragma{} -> typeError $ GenericError $ "OPTIONS pragma only allowed at beginning of file, before top module declaration"
+            _ -> uselessPragma $ P.text $ applyUnless b ("NO" ++) "INLINE directive only works on functions or constructors of records that allow copattern matching"
+        A.OptionsPragma{} -> uselessPragma $ "OPTIONS pragma only allowed at beginning of file, before top module declaration"
         A.DisplayPragma f ps e -> checkDisplayPragma f ps e
-        A.EtaPragma r -> do
-          let noRecord = typeError $ GenericError $
-                "ETA pragma is only applicable to coinductive records"
-          caseMaybeM (isRecord r) noRecord $ \case
-            Record{ recInduction = ind, recEtaEquality' = eta } -> do
-              unless (ind == Just CoInductive) $ noRecord
-              if | Specified NoEta{} <- eta -> typeError $ GenericError $
-                     "ETA pragma conflicts with no-eta-equality declaration"
-                 | otherwise -> return ()
-            _ -> __IMPOSSIBLE__
-          modifySignature $ updateDefinition r $ updateTheDef $ \case
-            def@Record{} -> def { recEtaEquality' = Specified YesEta }
-            _ -> __IMPOSSIBLE__
+
+        A.OverlapPragma q new -> do
+          ifNotM ((q `isInModule`) <$> currentModule)
+            (uselessPragma =<< fsep (
+              pwords "This" ++ [pretty new] ++
+              pwords "pragma must appear in the same module as the definition of" ++
+              [prettyTCM q]))
+
+            {- else -} do
+
+          def <- getConstInfo q
+          case defInstance def of
+            Just i@InstanceInfo{ instanceOverlap = DefaultOverlap } ->
+              modifyGlobalDefinition q \x -> x { defInstance = Just i{ instanceOverlap = new } }
+            Just InstanceInfo{ instanceOverlap = old } -> typeError $ DuplicateOverlapPragma q old new
+            Nothing -> uselessPragma =<< pretty new <+> "pragma can only be applied to instances"
+
+        A.EtaPragma q -> isRecord q >>= \case
+            Nothing -> noRecord
+            Just RecordData{ _recInduction = ind, _recEtaEquality' = eta }
+              | ind /= Just CoInductive  -> noRecord
+              | Specified NoEta{} <- eta -> uselessPragma "ETA pragma conflicts with no-eta-equality declaration"
+              | otherwise -> modifyRecEta q $ const $ Specified YesEta
+          where
+            noRecord = uselessPragma "ETA pragma is only applicable to coinductive records"
 
 -- | Type check a bunch of mutual inductive recursive definitions.
 --
@@ -874,36 +907,41 @@ checkSection e x tel ds =
 --   Returns the remaining module parameters as an open telescope.
 --   Warning: the returned telescope is /not/ the final result,
 --   an actual instantiation of the parameters does not occur.
-checkModuleArity
-  :: ModuleName           -- ^ Name of applied module.
+checkModuleArity ::
+     ModuleName           -- ^ Name of applied module.
   -> Telescope            -- ^ The module parameters.
-  -> [NamedArg A.Expr]  -- ^ The arguments this module is applied to.
+  -> [NamedArg A.Expr]    -- ^ The arguments this module is applied to.
   -> TCM Telescope        -- ^ The remaining module parameters (has free de Bruijn indices!).
-checkModuleArity m tel args = check tel args
-  where
-    bad = typeError $ ModuleArityMismatch m tel args
+checkModuleArity m tel = \case
+  []   -> return tel
+  a:as -> check1 tel a as
+    where
+    bad = typeError $ ModuleArityMismatch m tel (Left (a :| as))
 
     check :: Telescope -> [NamedArg A.Expr] -> TCM Telescope
     check tel []             = return tel
-    check EmptyTel (_:_)     = bad
-    check (ExtendTel dom@Dom{domInfo = info} btel) args0@(Arg info' arg : args) =
+    check tel (a : as)       = check1 tel a as
+
+    check1 :: Telescope -> NamedArg A.Expr -> [NamedArg A.Expr] -> TCM Telescope
+    check1 EmptyTel _ _ = bad
+    check1 (ExtendTel dom@Dom{domInfo = info} btel) arg0@(Arg info' arg) args = do
       let name = bareNameOf arg
           my   = bareNameOf dom
-          tel  = absBody btel in
+          tel  = absBody btel
       case (argInfoHiding info, argInfoHiding info', name) of
-        (Instance{}, NotHidden, _)        -> check tel args0
-        (Instance{}, Hidden, _)           -> check tel args0
-        (Instance{}, Instance{}, Nothing) -> check tel args
+        (Instance{}, NotHidden, _)        -> check1 tel arg0 args
+        (Instance{}, Hidden, _)           -> check1 tel arg0 args
+        (Instance{}, Instance{}, Nothing) -> check  tel args
         (Instance{}, Instance{}, Just x)
-          | Just x == my                  -> check tel args
-          | otherwise                     -> check tel args0
-        (Hidden, NotHidden, _)            -> check tel args0
-        (Hidden, Instance{}, _)           -> check tel args0
-        (Hidden, Hidden, Nothing)         -> check tel args
+          | Just x == my                  -> check  tel args
+          | otherwise                     -> check1 tel arg0 args
+        (Hidden, NotHidden, _)            -> check1 tel arg0 args
+        (Hidden, Instance{}, _)           -> check1 tel arg0 args
+        (Hidden, Hidden, Nothing)         -> check  tel args
         (Hidden, Hidden, Just x)
-          | Just x == my                  -> check tel args
-          | otherwise                     -> check tel args0
-        (NotHidden, NotHidden, _)         -> check tel args
+          | Just x == my                  -> check  tel args
+          | otherwise                     -> check1 tel arg0 args
+        (NotHidden, NotHidden, _)         -> check  tel args
         (NotHidden, Hidden, _)            -> bad
         (NotHidden, Instance{}, _)        -> bad
 
@@ -917,14 +955,14 @@ checkSectionApplication
   -> A.ScopeCopyInfo     -- ^ Imported names and modules
   -> A.ImportDirective
   -> TCM ()
-checkSectionApplication i e m1 modapp copyInfo dir =
-  traceCall (CheckSectionApplication (getRange i) e m1 modapp) $ do
+checkSectionApplication i er m1 modapp copyInfo dir =
+  traceCall (CheckSectionApplication (getRange i) er m1 modapp) $ do
   checkImportDirective dir
   -- A (non-erased) section application is type-checked in a
   -- non-erased context (#5410), except if hard compile-time mode is
   -- enabled (#4743).
   setRunTimeModeUnlessInHardCompileTimeMode $
-    checkSectionApplication' i e m1 modapp copyInfo
+    checkSectionApplication' i er m1 modapp copyInfo
 
 -- | Check an application of a section. (Do not invoke this procedure
 -- directly, use 'checkSectionApplication'.)
@@ -936,11 +974,11 @@ checkSectionApplication'
   -> A.ScopeCopyInfo     -- ^ Imported names and modules
   -> TCM ()
 checkSectionApplication'
-  i e m1 (A.SectionApp ptel m2 args) copyInfo = do
+  i er m1 (A.SectionApp ptel m2 args) copyInfo = do
   -- If the section application is erased, then hard compile-time mode
   -- is entered.
-  warnForPlentyInHardCompileTimeMode e
-  setHardCompileTimeModeIfErased e $ do
+  warnForPlentyInHardCompileTimeMode er
+  setHardCompileTimeModeIfErased er $ do
   -- Module applications can appear in lets, in which case we treat
   -- lambda-bound variables as additional parameters to the module.
   extraParams <- do
@@ -972,17 +1010,25 @@ checkSectionApplication'
     etaTel <- checkModuleArity m2 tel' args
     -- Take the module parameters that will be instantiated by @args@.
     let tel'' = telFromList $ take (size tel' - size etaTel) $ telToList tel'
-    reportSDoc "tc.mod.apply" 15 $ vcat
-      [ "applying section" <+> prettyTCM m2
-      , nest 2 $ "args =" <+> sep (map prettyA args)
-      , nest 2 $ "ptel =" <+> escapeContext impossible (size ptel) (prettyTCM ptel)
-      , nest 2 $ "tel  =" <+> prettyTCM tel
-      , nest 2 $ "tel' =" <+> prettyTCM tel'
-      , nest 2 $ "tel''=" <+> prettyTCM tel''
-      , nest 2 $ "eta  =" <+> escapeContext impossible (size ptel) (addContext tel'' $ prettyTCM etaTel)
-      ]
+    reportSDoc "tc.mod.apply" 15 $
+        "applying section" <+> prettyTCM m2
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "args =" <+> sep (map prettyA args)
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "ptel =" <+> escapeContext impossible (size ptel) (prettyTCM ptel)
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "tel  =" <+> prettyTCM tel
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "tel' =" <+> prettyTCM tel'
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "tel''=" <+> prettyTCM tel''
+    reportSDoc "tc.mod.apply" 15 $
+        nest 2 $ "eta  =" <+> escapeContext impossible (size ptel) (addContext tel'' $ prettyTCM etaTel)
+
     -- Now, type check arguments.
-    ts <- noConstraints (checkArguments_ CmpEq DontExpandLast (getRange i) args tel') >>= \case
+    -- Andreas, 2024-12-06: We fake a head A.Expr for the application.
+    let hd = A.Def $ mnameToQName m2
+    ts <- noConstraints (checkArguments_ CmpEq DontExpandLast hd args tel') >>= \case
       (ts', etaTel') | (size etaTel == size etaTel')
                      , Just ts <- allApplyElims ts' -> return ts
       _ -> __IMPOSSIBLE__
@@ -1049,8 +1095,7 @@ checkSectionApplication'
     [ nest 2 $ "vs      =" <+> text (show vs)
     -- , nest 2 $ "args    =" <+> text (show args)
     ]
-  when (tel == EmptyTel) $
-    typeError $ GenericError $ prettyShow (qnameToConcrete name) ++ " is not a parameterised section"
+  when (tel == EmptyTel) $ typeError $ ModuleArityMismatch x EmptyTel (Right vs)
 
   addContext telInst $ do
     vs <- moduleParamsToApply x

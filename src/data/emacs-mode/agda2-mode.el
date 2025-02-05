@@ -28,13 +28,12 @@
 
 ;;; Code:
 
-(defvar agda2-version "2.6.4"
+(defvar agda2-version "2.8.0"
   "The version of the Agda mode.
 Note that the same version of the Agda executable must be used.")
 
 (require 'cl-lib)
 (require 'compile)
-(require 'pp)
 (require 'time-date)
 (require 'eri)
 (require 'annotation)
@@ -99,12 +98,18 @@ argument, and does not need to be listed here."
   :type '(repeat string)
   :group 'agda2)
 
-(defvar agda2-backends '("GHC" "GHCNoMain" "JS" "LaTeX" "QuickLaTeX")
+(defvar agda2-backends '("GHC" "GHCNoMain" "JS" "LaTeX" "QuickLaTeX" "HTML")
   "Compilation backends.")
 
 (defcustom agda2-backend
-  ""
-  "The backend used to compile Agda programs (leave blank to ask every time)."
+  nil
+  "The backend used to compile Agda programs (nil to ask every time)."
+  :type 'string
+  :group 'agda2)
+
+(defcustom agda2-backend-default-payload
+  nil
+  "The default payload for interactive backend commands (nil to ask every time)."
   :type 'string
   :group 'agda2)
 
@@ -219,6 +224,7 @@ constituents.")
     (agda2-load                              "\C-c\C-l"           (global)       "Load")
     (agda2-load                              "\C-c\C-x\C-l")
     (agda2-compile                           "\C-c\C-x\C-c"       (global)       "Compile")
+    (agda2-backend-cmd                       "\C-c\C-i"           (global)       "Run backend interaction")
     (agda2-quit                              "\C-c\C-x\C-q"       (global)       "Quit")
     (agda2-restart                           "\C-c\C-x\C-r"       (global)       "Kill and restart Agda")
     (agda2-abort                             "\C-c\C-x\C-a"       (global)       "Abort a command")
@@ -233,7 +239,7 @@ constituents.")
     (agda2-give                              ,(kbd "C-c C-SPC")   (local)        "Give")
     (agda2-elaborate-give                    ,(kbd "C-c C-m")     (local)        "Elaborate and Give")
     (agda2-refine                            "\C-c\C-r"           (local)        "Refine")
-    (agda2-auto-maybe-all                    "\C-c\C-a"           (local global) "Auto")
+    (agda2-mimer-maybe-all                   "\C-c\C-a"           (local global) "Auto")
     (agda2-make-case                         "\C-c\C-c"           (local)        "Case")
     (agda2-goal-type                         "\C-c\C-t"           (local)        "Goal type")
     (agda2-show-context                      "\C-c\C-e"           (local)        "Context (environment)")
@@ -530,7 +536,7 @@ process."
 Sends the list of strings ARGS to the Agda2 interpreter, waits
 for output and executes the responses, if any.
 
-If SAVE is 'save, then the buffer is saved first.
+If SAVE is \\='save, then the buffer is saved first.
 
 If HIGHLIGHT is non-nil, then the buffer's syntax highlighting
 may be updated. This is also the case if the Agda process is
@@ -759,13 +765,13 @@ The user input is computed as follows:
   contains whitespace, then the input is taken from the
   minibuffer. In this case WANT is used as the prompt string.
 
-* Otherwise (including if WANT is 'goal) the goal contents are
+* Otherwise (including if WANT is \\='goal) the goal contents are
   used.
 
 If the user input is not taken from the goal, then an empty goal
 range is given.
 
-If SAVE is 'save, then the buffer is saved just before the
+If SAVE is \\='save, then the buffer is saved just before the
 command is sent to Agda (if it is sent)."
   (cl-multiple-value-bind (o g) (agda2-goal-at (point))
     (unless g (error "For this command, please place the cursor in a goal"))
@@ -804,24 +810,37 @@ command is sent to Agda (if it is sent)."
             (agda2-list-quote agda2-program-args)
             ))
 
-(defun agda2-compile ()
-  "Compile the current module.
+(defun agda2-read-backend ()
+  "Get the currently set backend from the `agda2-backend' variable,
+or ask the user for input in case the variable is not set."
+  (let ((name (cond
+    ((equal agda2-backend "MAlonzo")       "GHC")
+    ((equal agda2-backend "MAlonzoNoMain") "GHCNoMain")
+    ((equal agda2-backend nil)
+      (completing-read "Backend: " agda2-backends nil nil nil nil nil 'inherit-input-method))
+    (t agda2-backend))))
+  (when (equal name "") (error "No backend chosen"))
+  name))
+
+(defun agda2-compile (backend)
+  "Compile the current module using BACKEND.
 
 The variable `agda2-backend' determines which backend is used."
-  (interactive)
-  (let ((backend (cond ((equal agda2-backend "MAlonzo")       "GHC")
-                       ((equal agda2-backend "MAlonzoNoMain") "GHCNoMain")
-                       ((equal agda2-backend "")
-                        (completing-read "Backend: " agda2-backends
-                                         nil nil nil nil nil
-                                         'inherit-input-method))
-                       (t agda2-backend))))
-    (when (equal backend "") (error "No backend chosen"))
-    (agda2-go 'save t 'busy t "Cmd_compile"
-              backend
-              (agda2-string-quote (buffer-file-name))
-              (agda2-list-quote agda2-program-args)
-              )))
+  (interactive (list (agda2-read-backend)))
+  (agda2-go 'save t 'busy t "Cmd_compile"
+            backend
+            (agda2-string-quote (buffer-file-name))
+            (agda2-list-quote agda2-program-args)
+            ))
+
+(defun agda2-backend-cmd (backend payload)
+  "Run the current backend's (from variable `agda2-backend`) interaction command."
+  (interactive (list (agda2-read-backend) (or agda2-backend-default-payload (read-string "Payload: "))))
+  (if (agda2-goal-at (point))
+     (agda2-goal-cmd "Cmd_backend_hole" nil 'goal nil backend (agda2-string-quote payload))
+     (agda2-go 'save t 'busy t "Cmd_backend_top" backend (agda2-string-quote payload))
+  )
+)
 
 (defmacro agda2-maybe-forced (name comment cmd save want)
   "This macro constructs a function NAME which runs CMD.
@@ -886,16 +905,6 @@ of new goals."
   (if pmlambda
       (agda2-goal-cmd "Cmd_refine_or_intro True" 'save 'goal)
     (agda2-goal-cmd "Cmd_refine_or_intro False" 'save 'goal)))
-
-(defun agda2-autoOne ()
- "Simple proof search" (interactive)
- (agda2-goal-cmd "Cmd_autoOne" 'save 'goal))
-
-(defun agda2-autoAll ()
-  (interactive)
-  "Solves all goals by simple proof search."
-  (agda2-go nil nil 'busy t "Cmd_autoAll")
-)
 
 (defun agda2-make-case ()
   "Refine the pattern variables given in the goal.
@@ -963,8 +972,8 @@ The buffer is returned.")
       (compilation-mode "AgdaInfo")
       ;; Support for jumping to positions mentioned in the text.
       (set (make-local-variable 'compilation-error-regexp-alist)
-           '(("\\([\\\\/][^[:space:]]*\\):\\([0-9]+\\),\\([0-9]+\\)-\\(\\([0-9]+\\),\\)?\\([0-9]+\\)"
-              1 (2 . 5) (3 . 6))))
+           '(("\\([\\\\/][^[:space:]]*\\):\\([0-9]+\\)\\.\\([0-9]+\\)\\(-\\(\\([0-9]+\\)\\.\\)?\\([0-9]+\\)\\)?"
+              1 (2 . 6) (3 . 7))))
       ;; Do not skip errors that start in the same position as the
       ;; current one.
       (set (make-local-variable 'compilation-skip-to-next-location) nil)
@@ -1380,13 +1389,26 @@ Either only one if point is a goal, or all of them."
                           'agda2-solveAll))
 )
 
-(defun agda2-auto-maybe-all ()
-  "Run auto.
+(defun agda2-mimer-maybe-all ()
+  "Run proof search.
 Either only one if point is a goal, or all of them."
   (interactive)
   (call-interactively (if (agda2-goal-at (point))
-                          'agda2-autoOne
-                          'agda2-autoAll))
+                          'agda2-mimer
+                          'agda2-mimerAll))
+)
+
+(agda2-maybe-normalised-asis
+  agda2-mimer
+  "Run proof search on a goal."
+  "Cmd_autoOne"
+  'goal
+)
+
+(agda2-maybe-normalised-toplevel-asis-noprompt
+  agda2-mimerAll
+  "Solves all goals by simple proof search."
+  "Cmd_autoAll"
 )
 
 (agda2-maybe-normalised-toplevel-asis-noprompt
@@ -1649,7 +1671,12 @@ text properties."
     (error "no process")))
 
 (defun agda2-intersperse (sep xs)
-  (let(ys)(while xs (push (pop xs) ys)(push sep ys))(pop ys)(nreverse ys)))
+  (let (ys)
+    (while xs
+      (push (pop xs) ys)
+      (push sep ys))
+    (pop ys)
+    (nreverse ys)))
 
 (defun agda2-goal-Range (o)
   "The Haskell Range of goal overlay O."
@@ -1662,7 +1689,7 @@ POINTS must be a list of integers, and its length must be 0 or 2."
   (if points
       (format "(intervalsToRange (Just (mkAbsolute %s)) %s)"
               (agda2-string-quote (file-truename (buffer-file-name)))
-              (format "[Interval %s %s]"
+              (format "[Interval () %s %s]"
                       (agda2-mkPos (car points))
                       (agda2-mkPos (cadr points))))
     "noRange"))
@@ -1694,10 +1721,10 @@ points < 128) are converted to singleton strings."
 Removes any text properties, escapes newlines, double quotes,
 etc., adds surrounding double quotes, and converts non-ASCII
 characters to the \\xNNNN notation used in Haskell strings."
-  (let ((pp-escape-newlines t)
+  (let ((print-escape-newlines t)
         (s2 (copy-sequence s)))
     (set-text-properties 0 (length s2) nil s2)
-    (mapconcat 'agda2-char-quote (pp-to-string s2) "")))
+    (mapconcat 'agda2-char-quote (prin1-to-string s2) "")))
 
 (defun agda2-list-quote (strings)
   "Convert a list of STRINGS into a string representing it in Haskell syntax."
@@ -1949,7 +1976,7 @@ the argument is a positive number, otherwise turn it off."
 
 (defun agda2-get-agda-program-versions ()
   "Get \"version strings\" of executables starting with
-'agda-mode' in current path."
+\\='agda-mode\\=' in current path."
   (delete-dups
    (mapcar (lambda (path)
              ;; strip 'agda-mode' prefix

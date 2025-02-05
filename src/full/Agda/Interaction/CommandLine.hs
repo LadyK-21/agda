@@ -36,7 +36,6 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Errors
 import Agda.TypeChecking.Pretty ( PrettyTCM(prettyTCM) )
 import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Warnings (runPM)
 
 import Agda.Utils.FileName (absolute, AbsolutePath)
 import Agda.Utils.Maybe (caseMaybeM)
@@ -58,6 +57,7 @@ newtype ReplM a = ReplM { unReplM :: ReaderT ReplEnv (StateT ReplState IM) a }
     , HasOptions, MonadTCEnv, ReadTCState, MonadTCState, MonadTCM
     , MonadError TCErr
     , MonadReader ReplEnv, MonadState ReplState
+    , MonadFileId
     )
 
 runReplM :: Maybe AbsolutePath -> TCM () -> (AbsolutePath -> TCM CheckResult) -> ReplM () -> TCM ()
@@ -174,7 +174,8 @@ continueAfter m = withCurrentFile $ do
 withCurrentFile :: ReplM a -> ReplM a
 withCurrentFile cont = do
   mpath <- gets currentFile
-  localTC (\ e -> e { envCurrentPath = mpath }) cont
+  i <- traverse idFromFile mpath
+  localTC (\ e -> e { envCurrentPath = i }) cont
 
 loadFile :: ReplM () -> [String] -> ReplM ()
 loadFile reload [file] = do
@@ -295,14 +296,14 @@ typeOf s =
     do  e  <- parseExpr (unwords s)
         e0 <- typeInCurrent Normalised e
         e1 <- typeInCurrent AsIs e
-        liftIO . putStrLn =<< showA e1
+        liftIO . print =<< prettyA e1
 
 typeIn :: [String] -> TCM ()
 typeIn s@(_:_:_) =
     actOnMeta s $ \i e ->
     do  e1 <- typeInMeta i Normalised e
         e2 <- typeInMeta i AsIs e
-        liftIO . putStrLn =<< showA e1
+        liftIO . print =<< prettyA e1
 typeIn _ = liftIO $ putStrLn ":typeIn meta expr"
 
 showContext :: [String] -> TCM ()
@@ -351,5 +352,4 @@ help cs = putStr $ unlines $
 readM :: Read a => String -> TCM a
 readM s = maybe err return $ readMaybe s
   where
-  err    = throwError $ strMsg $ "Cannot parse: " ++ s
-  strMsg = Exception noRange . text
+  err = throwError $ GenericException $ "Cannot parse: " ++ s

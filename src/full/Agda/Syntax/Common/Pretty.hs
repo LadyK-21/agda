@@ -10,6 +10,7 @@ module Agda.Syntax.Common.Pretty
 
 import Prelude hiding (null)
 
+import qualified Data.List as List
 import qualified Data.Foldable as Fold
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
@@ -18,7 +19,7 @@ import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.IntSet (IntSet)
 import Data.IntMap (IntMap)
-import Data.Word (Word64)
+import Data.Word (Word64, Word32)
 import Data.Text (Text)
 import Data.Int (Int32)
 import Data.Map (Map)
@@ -39,11 +40,15 @@ import Data.Semigroup ((<>))
 import Agda.Utils.Float
 import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
+import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Null
 import Agda.Utils.Size
 
 import Agda.Syntax.Common.Aspect
+import Agda.Syntax.Position
 import Agda.Utils.Impossible
+import Agda.Utils.FileName
+
 
 -- * Pretty class
 
@@ -79,6 +84,7 @@ instance Pretty Bool    where pretty = text . show
 instance Pretty Int     where pretty = text . show
 instance Pretty Int32   where pretty = text . show
 instance Pretty Integer where pretty = text . show
+instance Pretty Word32  where pretty = text . show
 instance Pretty Word64  where pretty = text . show
 instance Pretty Double  where pretty = text . toStringWithoutDotZero
 instance Pretty Text    where pretty = text . T.unpack
@@ -97,8 +103,11 @@ instance a ~ Aspects => Pretty (P.Doc a) where
 instance Pretty () where
   pretty _ = P.empty
 
+instance (Pretty a, Pretty b) => Pretty (a, b) where
+    pretty (a, b) = parens $ (pretty a <> comma) <+> pretty b
+
 instance Pretty a => Pretty (Maybe a) where
-  prettyPrec p Nothing  = "(nothing)"
+  prettyPrec p Nothing  = P.empty
   prettyPrec p (Just x) = prettyPrec p x
 
 instance Pretty a => Pretty [a] where
@@ -119,6 +128,57 @@ instance Pretty a => Pretty (IntMap a) where
 instance (Pretty k, Pretty v) => Pretty (Map k v) where
   pretty = prettyMap . Map.toList
 
+-- Pretty instances for dependencies of this module (to avoid dependency cycles)
+
+instance Pretty AbsolutePath where
+  pretty = text . filePath
+
+instance Pretty RangeFile where
+  pretty = pretty . rangeFilePath
+
+prettyLineColumn :: Position' a -> Doc
+prettyLineColumn (Pn _ _ l c) = pretty l <> dot <> pretty c
+
+instance Pretty a => Pretty (Position' (Strict.Maybe a)) where
+  pretty p = case srcFile p of
+    Strict.Nothing -> prettyLineColumn p
+    Strict.Just f  -> pretty f <> colon <> prettyLineColumn p
+
+instance Pretty PositionWithoutFile where
+  pretty = prettyLineColumn
+
+instance Pretty IntervalWithoutFile where
+  pretty (Interval () s e)
+    | s == e    = start
+    | otherwise = start <> "-" <> end
+    where
+      sl = posLine s
+      el = posLine e
+      sc = posCol s
+      ec = posCol e
+
+      start :: Doc
+      start = pretty sl <> dot <> pretty sc
+
+      end :: Doc
+        | sl == el  = pretty ec
+        | otherwise = pretty el <> dot <> pretty ec
+
+instance Pretty a => Pretty (Interval' (Strict.Maybe a)) where
+  pretty i@(Interval f s e) = file <> pretty (Interval () s e)
+    where
+      file :: Doc
+      file = case f of
+               Strict.Nothing -> empty
+               Strict.Just f  -> pretty f <> colon
+
+instance Pretty a => Pretty (Range' (Strict.Maybe a)) where
+  pretty r = maybe empty pretty (rangeToIntervalWithFile r)
+
+instance (Pretty a, HasRange a) => Pretty (PrintRange a) where
+  pretty (PrintRange a) = pretty a <+> parens ("at" <+> pretty (getRange a))
+
+
 -- * Generalizing the original type from list to Foldable
 
 sep, fsep, hsep, hcat, vcat :: Foldable t => t Doc -> Doc
@@ -132,6 +192,9 @@ punctuate :: Foldable t => Doc -> t Doc -> [Doc]
 punctuate d = P.punctuate d . Fold.toList
 
 -- * 'Doc' utilities
+
+vsep :: [Doc] -> Doc
+vsep = vcat . List.intersperse ""
 
 pwords :: String -> [Doc]
 pwords = map text . words
@@ -176,6 +239,12 @@ mparens False = id
 parensNonEmpty :: Doc -> Doc
 parensNonEmpty d = if null d then empty else parens d
 
+-- | Return 'empty' for empty strings.
+textNonEmpty :: String -> Doc
+textNonEmpty = \case
+  "" -> empty
+  s  -> text s
+
 -- | @align max rows@ lays out the elements of @rows@ in two columns,
 -- with the second components aligned. The alignment column of the
 -- second components is at most @max@ characters to the right of the
@@ -203,6 +272,9 @@ pshow = text . show
 
 singPlural :: Sized a => a -> c -> c -> c
 singPlural xs singular plural = if natSize xs == 1 then singular else plural
+
+pluralS :: Sized a => a -> Doc -> Doc
+pluralS xs d = singPlural xs d (d <> "s")
 
 -- | Used for with-like 'telescopes'
 
@@ -252,10 +324,11 @@ parens p       = lparen <> p <> rparen
 brackets p     = lbrack <> p <> rbrack
 braces p       = lbrace <> p <> rbrace
 
-semi, comma, colon, space, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
+semi, comma, colon, dot, space, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
 semi   = hlSymbol $ char ';'
 comma  = hlSymbol $ char ','
 colon  = hlSymbol $ char ':'
+dot    = hlSymbol $ char '.'
 space  = hlSymbol $ char ' '
 equals = hlSymbol $ char '='
 lparen = hlSymbol $ char '('

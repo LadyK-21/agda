@@ -1,4 +1,3 @@
-{-# LANGUAGE GADTs              #-}
 
 {-| This module defines the notion of a scope and operations on scopes.
 -}
@@ -46,6 +45,7 @@ import Agda.Utils.Maybe (filterMaybe)
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty hiding ((<>))
 import qualified Agda.Syntax.Common.Pretty as P
+import Agda.Utils.Set1 ( Set1 )
 import Agda.Utils.Singleton
 import qualified Agda.Utils.Map as Map
 
@@ -86,7 +86,7 @@ localNameSpace PublicAccess    = PublicNS
 localNameSpace PrivateAccess{} = PrivateNS
 
 nameSpaceAccess :: NameSpaceId -> Access
-nameSpaceAccess PrivateNS = PrivateAccess Inserted
+nameSpaceAccess PrivateNS = privateAccessInserted
 nameSpaceAccess _         = PublicAccess
 
 -- | Get a 'NameSpace' from 'Scope'.
@@ -120,6 +120,8 @@ data ScopeInfo = ScopeInfo
       , _scopeInScope       :: InScopeSet
       , _scopeFixities      :: C.Fixities    -- ^ Maps concrete names C.Name to fixities
       , _scopePolarities    :: C.Polarities  -- ^ Maps concrete names C.Name to polarities
+      , _scopeRecords       :: Map A.QName (A.QName, Maybe Induction)
+        -- ^ Maps the name of a record to the name of its (co)constructor.
       }
   deriving (Show, Generic)
 
@@ -141,7 +143,7 @@ type ModuleMap = Map A.ModuleName [C.QName]
 -- type ModuleMap = Map A.ModuleName (List1 C.QName)
 
 instance Eq ScopeInfo where
-  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ =
+  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ _ =
     c1 == c2 && m1 == m2 && v1 == v2 && l1 == l2 && p1 == p2
 
 -- | Local variables.
@@ -150,19 +152,28 @@ type LocalVars = AssocList C.Name LocalVar
 -- | For each bound variable, we want to know whether it was bound by a
 --   λ, Π, module telescope, pattern, or @let@.
 data BindingSource
-  = LambdaBound  -- ^ @λ@ (currently also used for @Π@ and module parameters)
-  | PatternBound -- ^ @f ... =@
-  | LetBound     -- ^ @let ... in@
-  | WithBound    -- ^ @| ... in q@
+  = LambdaBound
+      -- ^ @λ@ (currently also used for @Π@ and module parameters)
+  | PatternBound Hiding
+      -- ^ @f ... =@.
+      --   Remember 'Hiding' for pattern variables @{x}@ and @{{x}}@.
+      --   This information is only used for checking pattern synonyms.
+      --   It is not serialized.
+  | LetBound
+      -- ^ @let ... in@
+  | WithBound
+      -- ^ @| ... in q@
+  | MacroBound
+      -- ^ Binding added to scope by one of context-manipulating reflection primitives
   deriving (Show, Eq, Generic)
 
 instance Pretty BindingSource where
   pretty = \case
     LambdaBound  -> "local"
-    PatternBound -> "pattern"
+    PatternBound _ -> "pattern"
     LetBound     -> "let-bound"
     WithBound    -> "with-bound"
-
+    MacroBound   -> "macro-bound"
 -- | A local variable can be shadowed by an import.
 --   In case of reference to a shadowed variable, we want to report
 --   a scope error.
@@ -195,7 +206,7 @@ shadowLocal ys (LocalVar x b zs) = LocalVar x b (List1.toList ys ++ zs)
 -- | Treat patternBound variable as a module parameter
 patternToModuleBound :: LocalVar -> LocalVar
 patternToModuleBound x
- | localBindingSource x == PatternBound =
+ | PatternBound _ <- localBindingSource x =
    x { localBindingSource = LambdaBound }
  | otherwise                     = x
 
@@ -258,6 +269,11 @@ scopePolarities :: Lens' ScopeInfo C.Polarities
 scopePolarities f s =
   f (_scopePolarities s) <&>
   \x -> s { _scopePolarities = x }
+
+scopeRecords :: Lens' ScopeInfo (Map A.QName (A.QName, Maybe Induction))
+scopeRecords f s =
+  f (_scopeRecords s) <&>
+  \x -> s { _scopeRecords = x }
 
 scopeFixitiesAndPolarities :: Lens' ScopeInfo (C.Fixities, C.Polarities)
 scopeFixitiesAndPolarities f s =
@@ -376,8 +392,16 @@ data KindOfName
   -- End @DefName@.  Keep these together in sequence, for sake of @isDefName@!
   deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
+-- | All kinds of regular definitions.
+defNameKinds :: [KindOfName]
+defNameKinds = [DataName .. OtherDefName]
+
 isDefName :: KindOfName -> Bool
 isDefName = (>= DataName)
+
+-- | Constructor and pattern synonyms.
+conLikeNameKinds :: [KindOfName]
+conLikeNameKinds = [ConName, CoConName, PatternSynName]
 
 isConName :: KindOfName -> Maybe Induction
 isConName = \case
@@ -516,7 +540,9 @@ data ResolvedName
     FieldName (List1 AbstractName)       -- ^ @('FldName' ==) . 'anameKind'@ for all names.
 
   | -- | Data or record constructor name.
-    ConstructorName (Set Induction) (List1 AbstractName) -- ^ @isJust . 'isConName' . 'anameKind'@ for all names.
+    ConstructorName
+      (Set1 Induction)      -- ^ 'Inductive' or 'CoInductive' or both.
+      (List1 AbstractName)  -- ^ @isJust . 'isConName' . 'anameKind'@ for all names.
 
   | -- | Name of pattern synonym.
     PatternSynResName (List1 AbstractName) -- ^ @('PatternSynName' ==) . 'anameKind'@ for all names.
@@ -546,6 +572,16 @@ data AmbiguousNameReason
       -- ^ The name resolves both to a local variable and some declared names.
   | AmbiguousDeclName (List2 AbstractName)
       -- ^ The name resolves to at least 2 declared names.
+  deriving (Show, Generic)
+
+-- | A failure in name resolution, indicating the reason that a name
+-- which /is/ in scope could not be returned from @tryResolveName@.
+data NameResolutionError
+  = IllegalAmbiguity  AmbiguousNameReason
+  -- ^ Ambiguous names are not supported in this situation.
+  | ConstrOfNonRecord C.QName ResolvedName
+  -- ^ The name was @Foo.constructor@, and @Foo@ is in scope, but it is
+  -- not a record.
   deriving (Show, Generic)
 
 -- | The flat list of ambiguous names in 'AmbiguousNameReason'.
@@ -627,13 +663,41 @@ mapNameSpaceM fd fm fs ns = update ns <$> fd (nsNames ns) <*> fm (nsModules ns) 
 
 instance Null Scope where
   empty = emptyScope
-  null  = __IMPOSSIBLE__
-    -- TODO: define when needed, careful about scopeNameSpaces!
+  -- -- Use default implementation of null
+  -- null Scope{ scopeName, scopeParents, scopeNameSpaces, scopeImports, scopeDatatypeModule } = and
+  --   [ null scopeName
+  --   , null scopeParents
+  --   , null scopeNameSpaces || all (null . snd) scopeNameSpaces
+  --   , null scopeImports
+  --   , null scopeDatatypeModule
+  --   ]
 
 instance Null ScopeInfo where
   empty = emptyScopeInfo
-  null  = __IMPOSSIBLE__
-    -- TODO: define when needed, careful about _scopeModules!
+  -- -- Use default implementation of null
+  -- null ScopeInfo
+  --   { _scopeCurrent
+  --   , _scopeModules
+  --   , _scopeVarsToBind
+  --   , _scopeLocals
+  --   , _scopePrecendence
+  --   , _scopeInverseName
+  --   , _scopeInverseModule
+  --   , _scopeInScope
+  --   , _scopeFixities
+  --   , _scopePolarities
+  --   } = and
+  --   [ null _scopeCurrent
+  --   , null _scopeModules || all null (Map.values _scopeModules)
+  --   , null _scopeVarsToBind
+  --   , null _scopeLocals
+  --   , null _scopePrecendence
+  --   , null _scopeInverseName
+  --   , null _scopeInverseModule
+  --   , null _scopeInScope
+  --   , null _scopeFixities
+  --   , null _scopePolarities
+  --   ]
 
 -- | The empty scope.
 emptyScope :: Scope
@@ -660,6 +724,7 @@ emptyScopeInfo = ScopeInfo
   , _scopeInScope       = Set.empty
   , _scopeFixities      = Map.empty
   , _scopePolarities    = Map.empty
+  , _scopeRecords       = Map.empty
   }
 
 -- | Map functions over the names and modules in a scope.
@@ -1045,6 +1110,9 @@ publicNames scope =
   Set.fromList $ List1.concat $ Map.elems $
   exportedNamesInScope $ mergeScopes $ Map.elems $ publicModules scope
 
+publicNamesOfModules :: Map A.ModuleName Scope -> [AbstractName]
+publicNamesOfModules = List1.concat . Map.elems . exportedNamesInScope . mergeScopes . Map.elems
+
 everythingInScope :: ScopeInfo -> NameSpace
 everythingInScope scope = allThingsInScope $ mergeScopes $
     (s0 :) $ map look $ scopeParents s0
@@ -1078,7 +1146,7 @@ everythingInScopeQualified scope =
 -- | Get all concrete names in scope. Includes bound variables.
 concreteNamesInScope :: ScopeInfo -> Set C.QName
 concreteNamesInScope scope =
-  Set.unions [ build allNamesInScope root, imported, locals ]
+  Set.unions [ build id allNamesInScope root, imported, locals ]
   where
     current = moduleScope $ scope ^. scopeCurrent
     root    = mergeScopes $ current : map moduleScope (scopeParents current)
@@ -1086,24 +1154,22 @@ concreteNamesInScope scope =
     locals  = Set.fromList [ C.QName x | (x, _) <- scope ^. scopeLocals ]
 
     imported = Set.unions
-               [ qual c (build exportedNamesInScope $ moduleScope a)
-               | (c, a) <- Map.toList $ scopeImports root ]
-    qual c = Set.map (q c)
+               [ build (qual c) exportedNamesInScope $ moduleScope a
+               | (c, a) <- Map.toList $ scopeImports root
+               ]
       where
-        q (C.QName x)  = C.Qual x
-        q (C.Qual m x) = C.Qual m . q x
+        qual (C.QName x)  = C.Qual x
+        qual (C.Qual m x) = C.Qual m . qual x
 
-    build :: (forall a. InScope a => Scope -> ThingsInScope a) -> Scope -> Set C.QName
-    build getNames s = Set.unions $
-        Set.fromAscList
-          (map C.QName $
-           Map.keys (getNames s :: ThingsInScope AbstractName)) :
-          [ Set.mapMonotonic (\ y -> C.Qual x y) $
-              build exportedNamesInScope $ moduleScope m
-          | (x, mods) <- Map.toList (getNames s)
-          , prettyShow x /= "_"
-          , AbsModule m _ <- List1.toList mods
-          ]
+    build :: (C.QName -> C.QName) -> (forall a. InScope a => Scope -> ThingsInScope a) -> Scope -> Set C.QName
+    build qual getNames s = Set.unions $
+        Set.mapMonotonic (qual . C.QName) (Map.keysSet (getNames s :: ThingsInScope AbstractName))
+        :
+        [ build (qual . C.Qual x) exportedNamesInScope $ moduleScope m
+        | (x, mods) <- Map.toList (getNames s)
+        , not $ isNoName x
+        , AbsModule m _ <- List1.toList mods
+        ]
 
     moduleScope :: A.ModuleName -> Scope
     moduleScope m = fromMaybe __IMPOSSIBLE__ $ Map.lookup m $ scope ^. scopeModules
@@ -1113,21 +1179,46 @@ scopeLookup :: InScope a => C.QName -> ScopeInfo -> [a]
 scopeLookup q scope = map fst $ scopeLookup' q scope
 
 scopeLookup' :: forall a. InScope a => C.QName -> ScopeInfo -> [(a, Access)]
-scopeLookup' q scope =
-  nubOn fst $
-    findName q root ++ maybeToList topImports ++ imports
+scopeLookup' q scope = nubOn fst $ inAllScopes ++ topImports ++ imports
   where
-
     -- 1. Finding a name in the current scope and its parents.
+    inAllScopes :: [(a, Access)]
+    inAllScopes = concatMap (findName q) allScopes
+
+    -- 2. Finding a name in the top imports.
+    topImports :: [(a, Access)]
+    topImports = case (inScopeTag :: InScopeTag a) of
+      NameTag   -> []
+      ModuleTag -> first (`AbsModule` Defined) <$> imported q
+
+    -- 3. Finding a name in the imports belonging to an initial part of the qualifier.
+    imports :: [(a, Access)]
+    imports = do
+      let -- return all possible splittings, e.g.
+          -- splitName X.Y.Z = [(X, Y.Z), (X.Y, Z)]
+          splitName :: C.QName -> [(C.QName, C.QName)]
+          splitName (C.QName x)  = []
+          splitName (C.Qual x q) =
+            (C.QName x, q) : [ (C.Qual x m, r) | (m, r) <- splitName q ]
+
+      (m, x) <- splitName q
+      m <- fst <$> imported m
+      findName x $ restrictPrivate $ moduleScope m
+
+    --------------------------------------------------------------------------------
 
     moduleScope :: A.ModuleName -> Scope
     moduleScope m = fromMaybe __IMPOSSIBLE__ $ Map.lookup m $ scope ^. scopeModules
 
-    current :: Scope
-    current = moduleScope $ scope ^. scopeCurrent
+    allScopes :: [Scope]
+    allScopes = current : map moduleScope (scopeParents current) where
+      current = moduleScope $ scope ^. scopeCurrent
 
-    root    :: Scope
-    root    = mergeScopes $ current : map moduleScope (scopeParents current)
+    imported :: C.QName -> [(A.ModuleName, Access)]
+    imported q = do
+      s <- allScopes
+      m <- maybeToList $ Map.lookup q $ scopeImports s
+      return (m, PublicAccess)
 
     -- Find a concrete, possibly qualified name in scope @s@.
     findName :: forall a. InScope a => C.QName -> Scope -> [(a, Access)]
@@ -1157,31 +1248,6 @@ scopeLookup' q scope =
         -- trace ("ss' = " ++ show ss') $ do
         s' <- maybeToList ss'
         findName q s'
-
-    -- 2. Finding a name in the top imports.
-
-    topImports :: Maybe (a, Access)
-    topImports = case (inScopeTag :: InScopeTag a) of
-      NameTag   -> Nothing
-      ModuleTag -> first (`AbsModule` Defined) <$> imported q
-
-    imported :: C.QName -> Maybe (A.ModuleName, Access)
-    imported q = fmap (,PublicAccess) $ Map.lookup q $ scopeImports root
-
-    -- 3. Finding a name in the imports belonging to an initial part of the qualifier.
-
-    imports :: [(a, Access)]
-    imports = do
-      (m, x) <- splitName q
-      m <- maybeToList $ fst <$> imported m
-      findName x $ restrictPrivate $ moduleScope m
-
-    -- return all possible splittings, e.g.
-    -- splitName X.Y.Z = [(X, Y.Z), (X.Y, Z)]
-    splitName :: C.QName -> [(C.QName, C.QName)]
-    splitName (C.QName x)  = []
-    splitName (C.Qual x q) =
-      (C.QName x, q) : [ (C.Qual x m, r) | (m, r) <- splitName q ]
 
 
 -- * Inverse look-up
@@ -1408,7 +1474,7 @@ blockOfLines _  [] = []
 blockOfLines hd ss = hd : map (nest 2) ss
 
 instance Pretty ScopeInfo where
-  pretty (ScopeInfo this mods toBind locals ctx _ _ _ _ _) = vcat $ concat
+  pretty (ScopeInfo this mods toBind locals ctx _ _ _ _ _ _) = vcat $ concat
     [ [ "ScopeInfo"
       , nest 2 $ "current =" <+> pretty this
       ]

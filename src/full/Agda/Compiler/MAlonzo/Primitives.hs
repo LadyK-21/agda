@@ -20,7 +20,6 @@ import Agda.Syntax.Treeless
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Primitive
 import Agda.TypeChecking.Reduce
-import Agda.TypeChecking.Pretty
 
 import Agda.Utils.Either
 import Agda.Utils.Lens
@@ -76,11 +75,7 @@ checkTypeOfMain' m@(MainFunctionDef def) = CheckedMainFunctionDef m <$> do
     ty <- reduce $ defType def
     case unEl ty of
       Def d _ | d == io -> return mainAlias
-      _                 -> do
-        err <- fsep $
-          pwords "The type of main should be" ++
-          [prettyTCM io] ++ pwords " A, for some A. The given type is" ++ [prettyTCM ty]
-        typeError $ GenericError $ show err
+      _ -> ghcBackendError $ WrongTypeOfMain io ty
   where
     mainAlias = HS.FunBind [HS.Match mainLHS [] mainRHS emptyBinds ]
     mainLHS   = HS.Ident "main"
@@ -116,7 +111,7 @@ treelessPrimName p =
     PIf     -> __IMPOSSIBLE__
 
 -- | Haskell modules to be imported for BUILT-INs
-importsForPrim :: BuiltinThings PrimFun -> [Definition] -> [HS.ModuleName]
+importsForPrim :: BuiltinThings -> [Definition] -> [HS.ModuleName]
 importsForPrim builtinThings defs = xForPrim table builtinThings defs ++ [HS.ModuleName "Data.Text"]
   where
   table = Map.fromList $ map (second HS.ModuleName)
@@ -148,7 +143,7 @@ importsForPrim builtinThings defs = xForPrim table builtinThings defs ++ [HS.Mod
 
 --------------
 
-xForPrim :: Map SomeBuiltin a -> BuiltinThings PrimFun -> [Definition] -> [a]
+xForPrim :: Map SomeBuiltin a -> BuiltinThings -> [Definition] -> [a]
 xForPrim table builtinThings defs = catMaybes
     [ Map.lookup s table
     | (s, def) <- Map.toList builtinThings
@@ -300,11 +295,6 @@ primBody s = maybe unimplemented (fromRight (hsVarUQ . HS.Ident) <$>) $ List.loo
   , Prim_unglueU      |-> return "\\_ _ _ _ x -> x"
   , PrimFaceForall    |-> return
                             "\\f -> f True == True && f False == True"
-  , PrimDepIMin       |-> return "\\i f -> if i then f () else False"
-  , PrimIdFace        |-> return "\\_ _ _ _ -> fst"
-  , PrimIdPath        |-> return "\\_ _ _ _ -> snd"
-  , PrimIdElim        |-> return
-                            "\\_ _ _ _ _ f x y -> f (fst y) x (snd y)"
   ]
   where
   x |-> s = (x, Left <$> s)
